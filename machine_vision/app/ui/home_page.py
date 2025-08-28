@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
     QFileDialog, QSizePolicy, QGroupBox ,QGridLayout
 )
-from PySide6.QtCore import Qt, QPoint, QRect, QEvent, QTimer
+from PySide6.QtCore import Qt, QPoint, QRect, QEvent, QTimer , Signal
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QFont
 from PySide6.QtWidgets import QApplication
 import app.matching
@@ -15,6 +15,7 @@ from app.camera_workers import USBCameraWorker, HikrobotCameraWorker
 
 class ImagePlaceholder(QLabel):
     """QLabel that stores original cv image and supports rubber-band style crop."""
+    cropFinished = Signal() 
     def __init__(self, text, parent=None):
         super().__init__(text, parent)
         self.original_cv_image = None
@@ -74,8 +75,9 @@ class ImagePlaceholder(QLabel):
             self.is_cropping = False
             self.update()
             # notify parent (assume parent widget has finish_crop)
-            if hasattr(self.parent(), "finish_crop"):
-                self.parent().finish_crop()
+            # if hasattr(self.parent(), "finish_crop"):
+            #     self.parent().finish_crop()
+            self.cropFinished.emit()
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -136,28 +138,9 @@ class HomePage(QWidget):
         self.image2 = ImagePlaceholder("IMAGE 2 (Template)", self)
         self.image3 = ImagePlaceholder("IMAGE 3 (Cropped Result)", self)
         self.image4 = ImagePlaceholder("IMAGE 4 (Processed)", self)
+        self.image1.cropFinished.connect(self.finish_crop)
 
-        # --- ใส่ QGroupBox ให้ image1, image2, image3 เพื่อแสดงชื่อกล่อง ---
-        self.image1_group = QGroupBox("Raw Image")
-        g1_layout = QVBoxLayout(self.image1_group)
-        g1_layout.setContentsMargins(6, 6, 6, 6)
-        g1_layout.addWidget(self.image1)
-
-        self.image2_group = QGroupBox("Matching Template")
-        g2_layout = QVBoxLayout(self.image2_group)
-        g2_layout.setContentsMargins(6, 6, 6, 6)
-        g2_layout.addWidget(self.image2)
-
-        self.image3_group = QGroupBox("Matching Result")
-        g3_layout = QVBoxLayout(self.image3_group)
-        g3_layout.setContentsMargins(6, 6, 6, 6)
-        g3_layout.addWidget(self.image3)
-
-        # ใส่ QGroupBox ให้ image4 ด้วย (Processed)
-        self.image4_group = QGroupBox("Detection Result")
-        g4_layout = QVBoxLayout(self.image4_group)
-        g4_layout.setContentsMargins(6, 6, 6, 6)
-        g4_layout.addWidget(self.image4)
+        
 
         # ตั้งค่า Style และการแสดงผล
         for w in (self.image1, self.image2, self.image3, self.image4):
@@ -199,19 +182,36 @@ class HomePage(QWidget):
         # ======================================================================
 
         # --- ส่วนซ้าย ---
+        image1_group = QGroupBox("RAW IMAGE")
+        image1_layout = QVBoxLayout()
+        image1_layout.addWidget(self.image1)
+        image1_group.setLayout(image1_layout)
+
+        # สร้าง GroupBox สำหรับ image2 และ image3
+        self.image2_group = QGroupBox("MATCHING TEMPLATE")
+        image2_layout = QVBoxLayout()
+        image2_layout.addWidget(self.image2)
+        self.image2_group.setLayout(image2_layout)
+
+        self.image3_group = QGroupBox("MATCHING RESULT")
+        image3_layout = QVBoxLayout()
+        image3_layout.addWidget(self.image3)
+        self.image3_group.setLayout(image3_layout)
+        
+        
+
         bottom_left_h_layout = QHBoxLayout()
         bottom_left_h_layout.addWidget(self.image2_group)
         bottom_left_h_layout.addWidget(self.image3_group)
- 
+
         left_v_layout = QVBoxLayout()
         # กำหนดสัดส่วนให้ image1 ใหญ่กว่าส่วนล่าง (2:1)
-        left_v_layout.addWidget(self.image1_group, stretch=2) 
-        left_v_layout.addLayout(bottom_left_h_layout, stretch=1)
+        left_v_layout.addWidget(image1_group, stretch=4)
+        left_v_layout.addLayout(bottom_left_h_layout, stretch=2)
 
         # --- ส่วนขวา ---
         # สร้าง GroupBox สำหรับ Controls
-        controls_group = QGroupBox("Controls")
-        
+        controls_group = QGroupBox("CONTROLS")
         # ใช้ GridLayout จัดเรียงปุ่มให้เป็นตาราง 2x2
         controls_grid_layout = QGridLayout()
         controls_grid_layout.addWidget(self.start_button, 0, 0)
@@ -221,9 +221,22 @@ class HomePage(QWidget):
         controls_group.setLayout(controls_grid_layout)
         
         right_v_layout = QVBoxLayout()
+        # สร้าง GroupBox สำหรับ image4
+        self.image4_group = QGroupBox("PROCESSED RESULT")
+        image4_layout = QVBoxLayout()
+        image4_layout.addWidget(self.image4)
+        self.image4_group.setLayout(image4_layout)
+
+        self.result_group = QGroupBox("RESULT")
+        result_layout = QVBoxLayout()
+        result_layout.addWidget(self.result_label)
+        self.result_group.setLayout(result_layout)
+
         # กำหนดสัดส่วนให้ image4 ใหญ่กว่าส่วน Controls (2:1)
-        right_v_layout.addWidget(self.image4_group, stretch=2)
+        right_v_layout.addWidget(self.image4_group, stretch=4)
+        right_v_layout.addWidget(self.result_group, stretch=1)
         right_v_layout.addWidget(controls_group, stretch=1)
+        
 
         # --- Layout หลัก (ซ้าย-ขวา) ---
         main_h_layout = QHBoxLayout()
@@ -232,10 +245,15 @@ class HomePage(QWidget):
         main_h_layout.addLayout(right_v_layout, stretch=2)
         
         # --- Layout รวมทั้งหมด (บน-ล่าง) ---
-        overall_v_layout = QVBoxLayout(self) # ใช้ self เพื่อบอกว่านี่คือ layout หลักของหน้าต่าง
+        overall_v_layout = QVBoxLayout(self)  # ใช้ self เพื่อบอกว่านี่คือ layout หลักของหน้าต่าง
         overall_v_layout.addLayout(main_h_layout)
-        overall_v_layout.addWidget(self.result_label) # เพิ่มแถบสถานะด้านล่าง
-        
+        # # สร้าง GroupBox สำหรับผลลัพธ์ (RESULT)
+        # self.result_group = QGroupBox("RESULT")
+        # result_layout = QVBoxLayout()
+        # result_layout.addWidget(self.result_label)
+        # self.result_group.setLayout(result_layout)
+        # overall_v_layout.addWidget(self.result_group)  # เพิ่มแถบสถานะด้านล่างในกล่อง
+
         # ======================================================================
         # 3. เชื่อมต่อ Signals
         # ======================================================================
@@ -302,7 +320,18 @@ class HomePage(QWidget):
             self.result_label.setText("Invalid crop")
             return
         self.template_cv_image = self.image1.original_cv_image[rect.y():rect.y()+rect.height(), rect.x():rect.x()+rect.width()].copy()
+        # update template preview and force repaint/layout so it's visible inside the QGroupBox
         self.image2.set_cv_image(self.template_cv_image, is_original=True)
+        # ensure widget and its group are repainted and layouts updated
+        try:
+            self.image2.update()
+            self.image2.repaint()
+            if hasattr(self, "image2_group"):
+                self.image2_group.updateGeometry()
+                self.image2_group.repaint()
+            QApplication.processEvents()
+        except Exception:
+            pass
         self.save_template_button.setEnabled(True)
         self.run_match_button.setEnabled(True)
         self.result_label.setText("Template created")
