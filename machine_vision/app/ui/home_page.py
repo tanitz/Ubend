@@ -137,7 +137,27 @@ class HomePage(QWidget):
         self.image3 = ImagePlaceholder("IMAGE 3 (Cropped Result)", self)
         self.image4 = ImagePlaceholder("IMAGE 4 (Processed)", self)
 
-        
+        # --- ใส่ QGroupBox ให้ image1, image2, image3 เพื่อแสดงชื่อกล่อง ---
+        self.image1_group = QGroupBox("Raw Image")
+        g1_layout = QVBoxLayout(self.image1_group)
+        g1_layout.setContentsMargins(6, 6, 6, 6)
+        g1_layout.addWidget(self.image1)
+
+        self.image2_group = QGroupBox("Matching Template")
+        g2_layout = QVBoxLayout(self.image2_group)
+        g2_layout.setContentsMargins(6, 6, 6, 6)
+        g2_layout.addWidget(self.image2)
+
+        self.image3_group = QGroupBox("Matching Result")
+        g3_layout = QVBoxLayout(self.image3_group)
+        g3_layout.setContentsMargins(6, 6, 6, 6)
+        g3_layout.addWidget(self.image3)
+
+        # ใส่ QGroupBox ให้ image4 ด้วย (Processed)
+        self.image4_group = QGroupBox("Detection Result")
+        g4_layout = QVBoxLayout(self.image4_group)
+        g4_layout.setContentsMargins(6, 6, 6, 6)
+        g4_layout.addWidget(self.image4)
 
         # ตั้งค่า Style และการแสดงผล
         for w in (self.image1, self.image2, self.image3, self.image4):
@@ -159,6 +179,16 @@ class HomePage(QWidget):
         self.run_match_button.setCheckable(True)           # ทำปุ่มเป็น toggle
         self.run_match_button.setEnabled(False)
 
+        # ปรับขนาดและสไตล์ปุ่มให้ใหญ่ขึ้น
+        btn_font = QFont()
+        btn_font.setPointSize(11)  # ปรับขนาดตัวอักษร
+        for b in (self.start_button, self.crop_button, self.save_template_button, self.run_match_button):
+            b.setFont(btn_font)
+            b.setMinimumHeight(44)                  # ความสูงขั้นต่ำของปุ่ม
+            b.setMinimumWidth(140)                  # ความกว้างขั้นต่ำ (ถ้าต้องการ)
+            b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            b.setStyleSheet("padding:8px;")         # เพิ่มช่องว่างภายในปุ่ม
+
         # Widget แถบสถานะ (Status bar)
         self.result_label = QLabel("Ready")
         self.result_label.setStyleSheet("background-color:#222; color:#ffd; padding:6px;")
@@ -170,12 +200,12 @@ class HomePage(QWidget):
 
         # --- ส่วนซ้าย ---
         bottom_left_h_layout = QHBoxLayout()
-        bottom_left_h_layout.addWidget(self.image2)
-        bottom_left_h_layout.addWidget(self.image3)
-
+        bottom_left_h_layout.addWidget(self.image2_group)
+        bottom_left_h_layout.addWidget(self.image3_group)
+ 
         left_v_layout = QVBoxLayout()
         # กำหนดสัดส่วนให้ image1 ใหญ่กว่าส่วนล่าง (2:1)
-        left_v_layout.addWidget(self.image1, stretch=2) 
+        left_v_layout.addWidget(self.image1_group, stretch=2) 
         left_v_layout.addLayout(bottom_left_h_layout, stretch=1)
 
         # --- ส่วนขวา ---
@@ -192,7 +222,7 @@ class HomePage(QWidget):
         
         right_v_layout = QVBoxLayout()
         # กำหนดสัดส่วนให้ image4 ใหญ่กว่าส่วน Controls (2:1)
-        right_v_layout.addWidget(self.image4, stretch=2)
+        right_v_layout.addWidget(self.image4_group, stretch=2)
         right_v_layout.addWidget(controls_group, stretch=1)
 
         # --- Layout หลัก (ซ้าย-ขวา) ---
