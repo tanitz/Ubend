@@ -19,6 +19,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QPoint, QRect
 from PySide6.QtGui import QPixmap, QImage, QPainter, QFont
+import machine_vision.app.matching as matching 
+import cv2, numpy as np, time, math
+from PySide6.QtWidgets import QApplication
+
 
 def convert_cv_to_pixmap(cv_image):
     """ฟังก์ชันสำหรับแปลงภาพจาก OpenCV (NumPy array) เป็น QPixmap"""
@@ -210,20 +214,18 @@ class MainWindow(QMainWindow):
         main_grid_layout.setColumnStretch(1, 1)
 
         # --- ส่วนของ Code Editor ด้านขวา ---
-        editor_group = QGroupBox("Code Editor")
-        editor_layout = QVBoxLayout()
+        
+        
         self.code_editor = QTextEdit()
         self.code_editor.setFont(QFont("Courier", 10))
         self.run_script_button = QPushButton("RUN SCRIPT")
         self.run_script_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         
-        editor_layout.addWidget(self.code_editor)
-        editor_layout.addWidget(self.run_script_button)
-        editor_group.setLayout(editor_layout)
+        
 
         # --- ประกอบ Layout หลัก ---
         main_h_layout.addWidget(left_container, 7)
-        main_h_layout.addWidget(editor_group, 3)
+        
 
         # --- เชื่อมต่อ Signals ---
         self.crop_button.setCheckable(True)
@@ -233,21 +235,9 @@ class MainWindow(QMainWindow):
         self.load_template_button.clicked.connect(self.load_template)
         self.prev_button.clicked.connect(self.run_test_on_previous)
         self.next_button.clicked.connect(self.run_test_on_next)
-        self.run_script_button.clicked.connect(self.process_image_from_3_to_4)
 
-        self.set_default_editor_code()
         self.update_button_states()
         self.showMaximized()
-
-    def set_default_editor_code(self):
-        """ตั้งค่าโค้ดเริ่มต้นใน Code Editor"""
-        default_code = (
-            "# ภาพจาก IMAGE 3 จะถูกส่งเข้ามาในตัวแปร 'input_image'\n"
-            "# ผลลัพธ์สุดท้ายต้องถูกเก็บไว้ในตัวแปร 'output_image'\n\n"
-            "gray = cv2.cvtColor(input_image, cv2.COLOR_BGR2GRAY)\n"
-            "output_image = cv2.Canny(gray, 100, 200)\n"
-        )
-        self.code_editor.setText(default_code)
 
     def update_button_states(self):
         """อัปเดตสถานะการเปิด/ปิดใช้งานของปุ่ม"""
@@ -367,10 +357,12 @@ class MainWindow(QMainWindow):
         self.run_test_on_current_index()
 
     def run_test_on_current_index(self):
+        import time
         if self.template_cv_image is None:
             self.result_label.setText("Cannot test: Please create a template by cropping first.")
             return
-        
+
+        start_ts = time.perf_counter()
         target_path = self.test_image_paths[self.current_test_index]
         try:
             with open(target_path, 'rb') as f:
@@ -379,110 +371,295 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.result_label.setText(f"Error opening {os.path.basename(target_path)}: {e}")
             return
-        
-        if target_img is not None:
-            self.perform_rotation_matching(target_img, self.template_cv_image)
 
-    def perform_rotation_matching(self, target_image, template):
-        self.result_label.setText(f"Matching against {os.path.basename(self.test_image_paths[self.current_test_index])}...")
-        QApplication.processEvents()
-        
-        processing_width = 600
-        original_width = target_image.shape[1]
-        scale_ratio = processing_width / original_width
-        
-        resized_target = cv2.resize(target_image, (processing_width, int(target_image.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
-        resized_template = cv2.resize(template, (int(template.shape[1] * scale_ratio), int(template.shape[0] * scale_ratio)), interpolation=cv2.INTER_AREA)
-
-        main_gray = cv2.cvtColor(resized_target, cv2.COLOR_BGR2GRAY)
-        template_gray = cv2.cvtColor(resized_template, cv2.COLOR_BGR2GRAY)
-        
-        best_score, best_angle, best_loc, best_size = -1, 0, None, (0,0)
-        
-        for angle in range(0, 360, 5):
-            center = (template_gray.shape[1] // 2, template_gray.shape[0] // 2)
-            rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
-            
-            cos, sin = np.abs(rot_mat[0, 0]), np.abs(rot_mat[0, 1])
-            new_w = int((template_gray.shape[0] * sin) + (template_gray.shape[1] * cos))
-            new_h = int((template_gray.shape[0] * cos) + (template_gray.shape[1] * sin))
-            
-            rot_mat[0, 2] += (new_w / 2) - center[0]
-            rot_mat[1, 2] += (new_h / 2) - center[1]
-            
-            rotated_template = cv2.warpAffine(template_gray, rot_mat, (new_w, new_h))
-            
-            if rotated_template.shape[0] > main_gray.shape[0] or rotated_template.shape[1] > main_gray.shape[1]:
-                continue
-
-            res = cv2.matchTemplate(main_gray, rotated_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(res)
-
-            if max_val > best_score:
-                best_score, best_loc, best_angle, best_size = max_val, max_loc, angle, (new_w, new_h)
-        
-        threshold = 0.5
-        display_img = target_image.copy()
-        
-        if best_score >= threshold:
-            self.result_label.setText(f"Match Found! Score: {best_score:.4f} at {best_angle}°")
-            
-            original_top_left = (int(best_loc[0] / scale_ratio), int(best_loc[1] / scale_ratio))
-            original_bottom_right = (int((best_loc[0] + best_size[0]) / scale_ratio), int((best_loc[1] + best_size[1]) / scale_ratio))
-            
-            cv2.rectangle(display_img, original_top_left, original_bottom_right, (0, 255, 0), 3)
-            
-            matched_area = target_image[original_top_left[1]:original_bottom_right[1], original_top_left[0]:original_bottom_right[0]]
-            
-            if matched_area.size > 0:
-                found_center = ((original_bottom_right[0] - original_top_left[0]) // 2, (original_bottom_right[1] - original_top_left[1]) // 2)
-                inv_rot_mat = cv2.getRotationMatrix2D(found_center, -best_angle, 1.0)
-                corrected_image = cv2.warpAffine(matched_area, inv_rot_mat, (matched_area.shape[1], matched_area.shape[0]))
-                self.image3.set_cv_image(corrected_image, is_original=True)
-            else:
-                 self.image3.set_cv_image(None, is_original=True)
-                 self.image3.setText("IMAGE 3 (Error)")
-
-        else:
-            self.result_label.setText(f"No match found. Best score: {best_score:.4f}")
-            self.image3.set_cv_image(None, is_original=True)
-            self.image3.setText("IMAGE 3 (No Match)")
-
-        self.image1.set_cv_image(display_img)
-        self.update_button_states()
-
-    def process_image_from_3_to_4(self):
-        """นำโค้ดจาก Editor มาประมวลผลภาพจากช่อง 3 และแสดงในช่อง 4"""
-        input_image = self.image3.original_cv_image
-        if input_image is None:
-            self.result_label.setText("No image in Result panel to process.")
+        if target_img is None:
+            self.result_label.setText("Cannot decode image.")
             return
 
-        code_to_run = self.code_editor.toPlainText()
-        
-        local_scope = {
-            'cv2': cv2,
-            'np': np,
-            'input_image': input_image.copy()
-        }
-        
+        # 1) matching / crop (measure)
+        match_start = time.perf_counter()
+        crop_image = self.rotation_matching(target_img, self.template_cv_image)
+        match_end = time.perf_counter()
+        t_match_ms = (match_end - match_start) * 1000.0
+
+        self.image3.set_cv_image(crop_image, is_original=True)
+        if crop_image is None or (hasattr(crop_image, "size") and crop_image.size == 0):
+            self.result_label.setText("No crop result from matching.")
+            self.image4.set_cv_image(None)
+            return
+
+        # 2) post-process (find_oring) (measure)
+        post_start = time.perf_counter()
+        final_img = self.find_oring(crop_image)   # เรียกแค่ครั้งเดียว
+        post_end = time.perf_counter()
+        t_post_ms = (post_end - post_start) * 1000.0
+
+        # total
+        t_total_ms = (post_end - start_ts) * 1000.0
+
+        # show result + timing
+        self.image4.set_cv_image(final_img, is_original=True)
+        timing = f"Time: matching {t_match_ms:.0f} ms | find_oring {t_post_ms:.0f} ms | total {t_total_ms:.0f} ms"
+        prev = self.result_label.text() or ""
+        self.result_label.setText(f"{prev} | {timing}")
+        print(f"[timing] {os.path.basename(target_path)} -> {timing}")
+
+
+    def rotation_matching(self, target_image, template):
+
+
+        start_t = time.time()
+        TIMEOUT = 12.0
+
+        if template is None or template.size == 0:
+            self.result_label.setText("No template.")
+            return
+
+        src = target_image.copy()
+        target_gray = cv2.cvtColor(target_image, cv2.COLOR_BGR2GRAY)
+        template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        th, tw = template_gray.shape
+
+        matches = matching.match_template_rotated_coarse_to_fine(
+            target_gray, template_gray,
+            coarse_step=2,  # coarse step finding
+            fine_step=1,
+            coarse_range=(-360, 360), # angle search range
+            fine_window=2,  # step search in best angle
+            candidates_per_angle=1, # increase number for detecting multiple object at same angle
+            min_score = 0.5, # minimum score to be considered a match
+            scale = 0.08,  # Scale is big, cost time, more accuracy & vise-versa
+            iou_thresh = 0.2 # overlay ratio
+        )
+        found_crop = False
+        crop = None  # ป้องกันกรณีไม่เจอ match แล้ว return ตัวแปรยังไม่ถูกกำหนด
+        for i, match in enumerate(matches):
+            pos = match["position"]
+            angle = match["angle"]
+            score = match["score"]
+            # print(pos, angle)
+            target_result = matching.draw_rotated_match(src, pos, tw, th, angle, label=f"#{i} {angle:.1f}° {score:.2f}")
+            rotated_src, rot_mat = matching.rotate_image(target_image, angle, border_value=255)
+            center_in_rot = matching.apply_affine_transform(pos, rot_mat)
+            cx_r, cy_r = int(round(center_in_rot[0])), int(round(center_in_rot[1]))
+            x0 = cx_r - tw // 2
+            y0 = cy_r - th // 2
+            x1 = x0 + tw
+            y1 = y0 + th
+            pad_left = max(0, -x0)
+            pad_top = max(0, -y0)
+            pad_right = max(0, x1 - rotated_src.shape[1])
+            pad_bottom = max(0, y1 - rotated_src.shape[0])
+
+            crop_x0 = max(0, x0)
+            crop_y0 = max(0, y0)
+            crop_x1 = min(rotated_src.shape[1], x1)
+            crop_y1 = min(rotated_src.shape[0], y1)
+            if crop_x1 > crop_x0 and crop_y1 > crop_y0:
+                crop = rotated_src[crop_y0:crop_y1, crop_x0:crop_x1]
+                if pad_top or pad_bottom or pad_left or pad_right:
+                    crop = cv2.copyMakeBorder(
+                        crop,
+                        top=pad_top, bottom=pad_bottom,
+                        left=pad_left, right=pad_right,
+                        borderType=cv2.BORDER_CONSTANT,
+                        value=255
+                    )
+                self.update_button_states() 
+                break  # ใช้ match แรกที่เจอ
+        if not found_crop and crop is None:
+            self.image3.set_cv_image(None)
+            self.update_button_states() 
+        self.image1.set_cv_image(target_result, is_original=True)
+        QApplication.processEvents()
+        return crop
+
+    def find_oring(self, image: np.ndarray,
+                   large_area: int = 500,
+                   dif_zone: int = 20,
+                   width_change_threshold: float = 1.1,
+                   h_oring: int = 65,           # เพิ่ม: high oring
+                   w_oring: int = 110          # เพิ่ม: width oring
+                   ) -> np.ndarray:
+        """
+        หา O-ring แล้ววาดผลลัพธ์ทั้งหมด ส่งคืนภาพสุดท้ายพร้อมแสดงผล
+        - h_oring: เกณฑ์ขั้นต่ำของ |avg_y - y_max|
+        - w_oring: เกณฑ์ขั้นต่ำของความกว้างสี่เหลี่ยม (px)
+        """
+        # ตรวจสอบ input
+        if image is None or not isinstance(image, np.ndarray) or image.size == 0:
+            return np.zeros((400, 600, 3), dtype=np.uint8)
+
+        # สำเนาภาพต้นฉบับ
+        img = image.copy()
+
+        # 1) สร้าง mask เบื้องต้นจากช่อง S (Saturation) และ inpaint
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        s_increased = cv2.add(s, 10)
+
+        _, object_mask = cv2.threshold(s_increased, 0, 100, cv2.THRESH_BINARY)
+        _, hole_mask = cv2.threshold(s_increased, 100, 255, cv2.THRESH_BINARY_INV)
+        inpaint_mask = cv2.bitwise_and(object_mask, hole_mask)
         try:
-            exec(code_to_run, {}, local_scope)
-            
-            output_image = local_scope.get('output_image')
+            _ = cv2.inpaint(s_increased, inpaint_mask, 1, cv2.INPAINT_NS)
+        except Exception:
+            pass
 
-            if output_image is not None:
-                self.image4.set_cv_image(output_image, is_original=True)
-                self.result_label.setText("Script executed successfully.")
-            else:
-                self.result_label.setText("Script ran, but 'output_image' variable not found.")
+        contours, _ = cv2.findContours(inpaint_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        except Exception as e:
-            self.result_label.setText(f"Script Error: {e}")
+        filled = np.zeros_like(inpaint_mask)
+        if contours:
+            cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
+
+        # 2) ทำให้ mask เนียนขึ้น
+        blurred = cv2.GaussianBlur(filled, (15, 15), 0)
+        _, smoothed = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+        contours2, _ = cv2.findContours(smoothed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 3) เลือกเฉพาะคอนทัวร์ใหญ่
+        large_contours = [c for c in contours2 if cv2.contourArea(c) >= large_area]
+
+        # 4) วาดเส้นขอบชิ้นงานทับบนภาพต้นฉบับ แล้ว blend ให้เห็นชัด
+        overlay = img.copy()
+        if large_contours:
+            cv2.drawContours(overlay, large_contours, -1, (0, 0, 200), 5)
+        p = cv2.addWeighted(img, 0.7, overlay, 0.5, 0)
+
+        # 5) วิเคราะห์เฉพาะโซนล่าง (3 และ 4) และวาดกล่อง/ข้อความผลลัพธ์บน p
+        hh, ww = p.shape[:2]
+        x_mid = ww // 2
+        y_mid = int(np.clip(hh // 2 - dif_zone, 0, hh))
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        label_color = (0, 0, 255)
+
+        # map ชื่อโซน -> oring1/oring2 และเก็บผลลัพธ์ต่อโซน
+        zone_names = {3: "oring1", 4: "oring2"}
+        zone_status = {}  # เช่น {3: "OK", 4: "NG"}
+
+        pts = None
+        if large_contours:
+            try:
+                pts = np.vstack(large_contours)[:, 0, :].astype(np.int32)
+            except Exception:
+                pts = None
+
+        zones = {
+            3: (0, x_mid, y_mid, hh),   # bottom-left
+            4: (x_mid, ww, y_mid, hh),  # bottom-right
+        }
+        avg_ys = {}
+        zone_y_maxs = {}
+
+        for z, (x0, x1, y0, y1) in zones.items():
+            if pts is None or pts.size == 0:
+                continue
+
+            mask_zone = (pts[:, 0] >= x0) & (pts[:, 0] < x1) & (pts[:, 1] >= y0) & (pts[:, 1] < y1)
+            pts_zone = pts[mask_zone]
+            if pts_zone.size == 0:
+                continue
+
+            x_min = int(np.min(pts_zone[:, 0]))
+            x_max = int(np.max(pts_zone[:, 0]))
+            y_max = int(np.max(pts_zone[:, 1]))
+
+            y_at_x_min = int(np.median(pts_zone[pts_zone[:, 0] == x_min][:, 1])) if np.any(pts_zone[:, 0] == x_min) else int(np.median(pts_zone[:, 1]))
+            y_at_x_max = int(np.median(pts_zone[pts_zone[:, 0] == x_max][:, 1])) if np.any(pts_zone[:, 0] == x_max) else int(np.median(pts_zone[:, 1]))
+            x_at_y_max = int(np.median(pts_zone[pts_zone[:, 1] == y_max][:, 0])) if np.any(pts_zone[:, 1] == y_max) else int(np.median(pts_zone[:, 0]))
+
+            avg_y = (y_at_x_min + y_at_x_max) // 2
+            avg_ys[z] = avg_y
+            zone_y_maxs[z] = y_max
+
+            # จุด X ที่ y_max
+            # cv2.circle(p, (x_at_y_max, y_max), 6, (255, 0, 0), -1)
+
+            rect_width = x_max - x_min
+            rect_height = max(1, int(0.5 * rect_width))
+            top_y = max(0, avg_y - rect_height // 2)
+            bottom_y = min(hh - 1, avg_y + rect_height // 2)
+
+            diff_val = abs(avg_y - y_max)
+            fill_color = (0, 255, 0) if (diff_val > h_oring and rect_width > w_oring) else (0, 0, 255)
+            text_result = "OK" if (diff_val > h_oring and rect_width > w_oring) else "NG"
+            zone_status[z] = text_result  # เก็บผลของโซนนี้
+
+            overlay2 = p.copy()
+            cv2.rectangle(overlay2, (x_min, top_y), (x_max, bottom_y), fill_color, -1)
+            p = cv2.addWeighted(overlay2, 0.4, p, 0.6, 0)
+            cv2.rectangle(p, (x_min, top_y), (x_max, bottom_y), (255, 0, 0), 1)
+
+            # แสดงข้อความ oringX ok/ng ใกล้กรอบ
+    
+
+        # ข้อความสรุปด้านบนภาพ
+        s1 = zone_status.get(3, "NA").upper()
+        s2 = zone_status.get(4, "NA").upper()
+        summary = f"oring1 {s1.lower()} | oring2 {s2.lower()}"
+
+        if s1 == "OK" and s2 == "OK":
+            top_color = (0, 255, 0)      # เขียว: ผ่านทั้งสอง
+        elif s1 == "NG" or s2 == "NG":
+            top_color = (0, 0, 255)      # แดง: มีตัวใดตัวหนึ่งไม่ผ่าน
+        else:
+            top_color = (0, 255, 255)    # เหลือง: ข้อมูลไม่ครบ (NA)
+
+        cv2.putText(p, summary, (10, 30), font, 0.8, top_color, 2, cv2.LINE_AA)
+
+
+        # อัปเดต RESULT label ใน UI
+        try:
+            self.result_label.setText(summary)
+        except Exception:
+            pass
+
+        return p
+
 
 
 if __name__ == "__main__":
+    # --- เพิ่มไฟล์เริ่มต้น ---
+    default_image_path = "/home/snc/Documents/Ubend/machine_vision/image_demo/image_10.jpg"
+    default_template_path = "/home/snc/Documents/Ubend/machine_vision/image_demo/Template.png"
+
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.show()
+    window.showFullScreen()
+
+    # --- โหลดภาพหลักและเทมเพลตทันทีเมื่อเริ่มโปรแกรม ---
+    if os.path.exists(default_image_path):
+        try:
+            with open(default_image_path, 'rb') as f:
+                file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
+            window.main_cv_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            window.image1.set_cv_image(window.main_cv_image, is_original=True)
+        except Exception as e:
+            window.result_label.setText(f"Error opening default image: {e}")
+
+    if os.path.exists(default_template_path):
+        try:
+            with open(default_template_path, 'rb') as f:
+                file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
+            window.template_cv_image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+            window.image2.set_cv_image(window.template_cv_image, is_original=True)
+            window.result_label.setText("Template loaded automatically. Ready to test.")
+        except Exception as e:
+            window.result_label.setText(f"Error opening default template: {e}")
+
+    # --- เพิ่มการค้นหา test images อัตโนมัติและรันเทสทันที ---
+    if window.main_cv_image is not None:
+        folder = os.path.dirname(default_image_path)
+        current_file = os.path.basename(default_image_path)
+        valid_extensions = ['.png', '.jpg', '.jpeg', '.bmp']
+        all_files = sorted([f for f in os.listdir(folder) if any(f.lower().endswith(ext) for ext in valid_extensions)])
+        window.test_image_paths = [os.path.join(folder, f) for f in all_files if f != current_file]
+        window.current_test_index = 0 if window.test_image_paths else -1
+
+    window.update_button_states()
+
+    # --- รันเทสทันทีถ้ามีเทมเพลตและ test image ---
+    if window.template_cv_image is not None and window.test_image_paths:
+        window.run_test_on_current_index()
+
     sys.exit(app.exec())
