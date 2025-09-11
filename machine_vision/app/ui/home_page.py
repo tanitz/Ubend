@@ -12,6 +12,33 @@ from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QFont
 from PySide6.QtWidgets import QApplication
 import app.matching
 from app.camera_workers import USBCameraWorker, HikrobotCameraWorker
+import configparser
+from dataclasses import dataclass
+import app.config_manager as cfg_mgr
+
+@dataclass
+class Config:
+    camera_source: str = "Hikrobot"
+    # เพิ่ม field อื่นๆ ตามต้องการ
+
+def _load_config() -> Config:
+    cfg = Config()
+    # คาดว่า config.ini อยู่ที่ repository root (machine_vision/config.ini)
+    ini_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.ini"))
+    parser = configparser.ConfigParser()
+    try:
+        if os.path.exists(ini_path):
+            parser.read(ini_path)
+            # อ่าน section/option ตามโครงไฟล์ของคุณ
+            if parser.has_section("camera"):
+                cfg.camera_source = parser.get("camera", "source", fallback=cfg.camera_source)
+    except Exception:
+        # ป้องกัน crash ถ้าไฟล์มีปัญหา
+        pass
+    return cfg
+
+# โหลด .ini หนึ่งครั้งเมื่อ module นี้ถูก import
+CONFIG = _load_config()
 
 class ImagePlaceholder(QLabel):
     """QLabel that stores original cv image and supports rubber-band style crop."""
@@ -34,24 +61,46 @@ class ImagePlaceholder(QLabel):
             super().setPixmap(self._pixmap)
             return
         if is_original:
+            # store original full-res image so we can rescale on resize
             self.original_cv_image = cv_image.copy()
-        # convert to QPixmap
-        if len(cv_image.shape) == 2:
-            h, w = cv_image.shape
+
+        src = cv_image if not is_original else self.original_cv_image
+
+        # convert to QPixmap from src (use original when available to avoid multiple conversions)
+        if src is None:
+            self._pixmap = QPixmap()
+            super().setPixmap(self._pixmap)
+            return
+
+        if len(src.shape) == 2:
+            h, w = src.shape
             bytes_per_line = w
-            qimg = QImage(cv_image.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+            qimg = QImage(src.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
         else:
-            h, w, ch = cv_image.shape
-            rgb = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+            h, w, ch = src.shape
+            rgb = cv2.cvtColor(src, cv2.COLOR_BGR2RGB)
             bytes_per_line = ch * w
             qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
-        # รีขนาดภาพให้พอดีกับขนาดกล่อง (รักษาอัตราส่วน)
-        target_w = self.width()
-        target_h = self.height()
+
+        # ถ้าขนาด widget ยังไม่ถูกตั้ง ให้เก็บ pixmap เต็มความละเอียดไว้ก่อน
+        target_w = max(1, self.width())
+        target_h = max(1, self.height())
+        # scale ให้เต็มพื้นที่โดยรักษาอัตราส่วน
         scaled = pix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._pixmap = scaled
         super().setPixmap(self._pixmap)
+
+    def resizeEvent(self, event):
+        """เมื่อ widget ถูกย่อ/ขยาย ให้สเกลภาพจาก original_cv_image ใหม่เสมอ."""
+        super().resizeEvent(event)
+        if self.original_cv_image is not None:
+            # ใช้ original_cv_image เพื่อได้คุณภาพดีที่สุดเมื่อสเกลใหม่
+            try:
+                self.set_cv_image(self.original_cv_image, is_original=True)
+            except Exception:
+                # ป้องกัน crash ถ้าเกิดขณะ resize
+                pass
 
     def set_cropping_mode(self, enabled: bool):
         self.is_cropping = enabled
@@ -119,9 +168,12 @@ class ImagePlaceholder(QLabel):
 
 class HomePage(QWidget):
     """Main page: uses Hikrobot (or USB) camera as source and provides matching UI."""
-    def __init__(self, config_manager):
+    oring_status = Signal(str, str)
+    emit_summary = Signal(str)
+    def __init__(self, config_manager=None):
         super().__init__()
-        self.config_manager = config_manager
+        # ใช้ config_manager ที่ส่งมา ถ้าเป็น None ให้ใช้ singleton ที่โหลด .ini เมื่อเริ่มโปรแกรม
+        self.config_manager = config_manager if config_manager is not None else cfg_mgr.CONFIG_MANAGER
         self.is_camera_on = False
         self.camera_worker = None
         self.cv_frame = None
@@ -246,6 +298,10 @@ class HomePage(QWidget):
         
         # --- Layout รวมทั้งหมด (บน-ล่าง) ---
         overall_v_layout = QVBoxLayout(self)  # ใช้ self เพื่อบอกว่านี่คือ layout หลักของหน้าต่าง
+        title = QLabel("DASHBOARD")
+        title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #003366;")
+        overall_v_layout.addWidget(title)
         overall_v_layout.addLayout(main_h_layout)
         # # สร้าง GroupBox สำหรับผลลัพธ์ (RESULT)
         # self.result_group = QGroupBox("RESULT")
@@ -268,6 +324,21 @@ class HomePage(QWidget):
         self.matching_running = False
         self.destroyed.connect(self.cleanup)
 
+        # load default template from machine_vision/temp.jpg (if exists)
+        try:
+            default_template_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "temp.jpg")
+            )
+            if os.path.exists(default_template_path):
+                tpl = cv2.imread(default_template_path)
+                if tpl is not None:
+                    self.template_cv_image = tpl
+                    self.image2.set_cv_image(self.template_cv_image, is_original=True)
+                    self.save_template_button.setEnabled(True)
+                    self.run_match_button.setEnabled(True)
+                    self.result_label.setText(f"Template loaded: {os.path.basename(default_template_path)}")
+        except Exception:
+            pass
 
     def toggle_camera(self):
         if not self.is_camera_on:
@@ -329,7 +400,8 @@ class HomePage(QWidget):
             if hasattr(self, "image2_group"):
                 self.image2_group.updateGeometry()
                 self.image2_group.repaint()
-            QApplication.processEvents()
+            QApplication.processEvents(
+)
         except Exception:
             pass
         self.save_template_button.setEnabled(True)
@@ -359,7 +431,7 @@ class HomePage(QWidget):
             if self.cv_frame is None:
                 self.result_label.setText("No live frame")
                 return
-
+            
             # rotation_matching
             t0 = time.perf_counter()
             crop = self.rotation_matching(self.cv_frame, self.template_cv_image)
@@ -402,6 +474,7 @@ class HomePage(QWidget):
 
         finally:
             self.matching_running = False
+            self.cv_frame = None
 
     def toggle_auto_match(self, checked: bool):
         """เริ่ม/หยุด loop การ match โดยใช้ timer"""
@@ -444,13 +517,13 @@ class HomePage(QWidget):
 
         matches = app.matching.match_template_rotated_coarse_to_fine(
             target_gray, template_gray,
-            coarse_step=2,  # coarse step finding
-            fine_step=1,
-            coarse_range=(-360, 360), # angle search range
-            fine_window=2,  # step search in best angle
-            candidates_per_angle=1, # increase number for detecting multiple object at same angle
+            coarse_step=6,  # coarse step finding
+            fine_step=0.1,
+            coarse_range=(-180, 180), # angle search range
+            fine_window=0.1,  # step search in best angle
+            candidates_per_angle=3, # increase number for detecting multiple object at same angle
             min_score = 0.5, # minimum score to be considered a match
-            scale = 0.07,  # Scale is big, cost time, more accuracy & vise-versa
+            scale = 0.08,  # Scale is big, cost time, more accuracy & vise-versa
             iou_thresh = 0.2 # overlay ratio
         )
         found_crop = False
@@ -459,6 +532,18 @@ class HomePage(QWidget):
             pos = match["position"]
             angle = match["angle"]
             score = match["score"]
+            if -80.0 < angle < -75.0:
+                angle = angle-6
+                #pos offset x -2
+                pos = (pos[0], pos[1]+20)
+            if -133.0 < angle < -130.0:
+                #angle = angle-6
+                #pos offset x -2
+                pos = (pos[0]+40, pos[1]+50)
+            if 105.0 < angle < 110.0:
+                angle = angle-10
+                #pos offset x -2
+                pos = (pos[0]+20, pos[1]-20)
             # print(pos, angle)
             target_result = app.matching.draw_rotated_match(src, pos, tw, th, angle, label=f"#{i} {angle:.1f}° {score:.2f}")
             rotated_src, rot_mat = app.matching.rotate_image(target_image, angle, border_value=255)
@@ -496,35 +581,87 @@ class HomePage(QWidget):
         return crop
 
     def find_oring(self, image: np.ndarray,
-                   large_area: int = 500,
-                   dif_zone: int = 20,
+                   large_area: int = 5000,
+                   dif_zone: int = 0,
                    h_oring: int = 65,
                    w_oring: int = 110) -> np.ndarray:
         """Simplified find_oring adapted from matching_check.py"""
         if image is None or not isinstance(image, np.ndarray) or image.size == 0:
             return np.zeros((400, 600, 3), dtype=np.uint8)
+        # read main params from config_manager (allow override by explicit args)
+        large_area = int(getattr(self.config_manager, "large_area", large_area)) if large_area == 5000 else int(large_area)
+        dif_zone = int(getattr(self.config_manager, "dif_zone", dif_zone)) if dif_zone == 0 else int(dif_zone)
+        h_oring = int(getattr(self.config_manager, "h_oring", h_oring)) if h_oring == 65 else int(h_oring)
+        w_oring = int(getattr(self.config_manager, "w_oring", w_oring)) if w_oring == 110 else int(w_oring)
+
+        # read image-processing params from config_manager
+        blur_kernel = int(getattr(self.config_manager, "blur_kernel", 15))
+        # ensure odd kernel size
+        if blur_kernel % 2 == 0:
+            blur_kernel = max(3, blur_kernel - 1)
+        canny_thresh1 = int(getattr(self.config_manager, "canny_thresh1", 50))
+        canny_thresh2 = int(getattr(self.config_manager, "canny_thresh2", 90))
+        morph_kernel = int(getattr(self.config_manager, "morph_kernel", 15))
+        if morph_kernel <= 0:
+            morph_kernel = 15
+        try:
+            rect_height_ratio = float(getattr(self.config_manager, "rect_height_ratio", 0.5))
+        except Exception:
+            rect_height_ratio = 0.5
+
         img = image.copy()
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        _, s, _ = cv2.split(hsv)
-        s_increased = cv2.add(s, 10)
+        _, s, v = cv2.split(hsv)
+        # note: original used v and named s_increased; keep behaviour but clarity:
+        channel = v
+        s_increased = cv2.add(channel, 10)
         _, object_mask = cv2.threshold(s_increased, 0, 100, cv2.THRESH_BINARY)
-        _, hole_mask = cv2.threshold(s_increased, 100, 255, cv2.THRESH_BINARY_INV)
+        _, hole_mask = cv2.threshold(s_increased, 30, 255, cv2.THRESH_BINARY_INV)
         inpaint_mask = cv2.bitwise_and(object_mask, hole_mask)
         try:
             _ = cv2.inpaint(s_increased, inpaint_mask, 1, cv2.INPAINT_NS)
         except Exception:
             pass
-        contours, _ = cv2.findContours(inpaint_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        filled = np.zeros_like(inpaint_mask)
-        if contours:
-            cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
-        blurred = cv2.GaussianBlur(filled, (15, 15), 0)
-        _, smoothed = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-        contours2, _ = cv2.findContours(smoothed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        blurred = cv2.GaussianBlur(inpaint_mask, (blur_kernel, blur_kernel), 0)
+        _, smoothed = cv2.threshold(blurred, 40, 255, cv2.THRESH_BINARY)
+        edges = cv2.Canny(smoothed, canny_thresh1, canny_thresh2)
+        contours2, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        print(cv2.contourArea(contours2[0]))
+        # DEBUG: print counts (จะพิมพ์เฉพาะเมื่อเปิด env UBEND_DEBUG=1)
+        try:
+            if os.environ.get("UBEND_DEBUG"):
+                print("find_oring: contours total=", len(contours2), "large_area=", large_area)
+        except Exception:
+            pass
+
         large_contours = [c for c in contours2 if cv2.contourArea(c) >= large_area]
+
+        # Fallback: ถ้าไม่มี large_contours ให้ลองลดเกณฑ์และลอง morphology เพื่อช่วยเชื่อมรูปร่าง
+        if not large_contours and contours2:
+            # ใช้ top few contours แทน (ลดเกณฑ์)
+            small_sorted = sorted(contours2, key=cv2.contourArea, reverse=True)[:4]
+            large_contours = small_sorted
+
+        if not large_contours:
+            # morphology fallback
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_kernel, morph_kernel))
+            closed = cv2.morphologyEx(smoothed, cv2.MORPH_CLOSE, kernel)
+            edges2 = cv2.Canny(closed, max(10, canny_thresh1 - 10), min(255, canny_thresh2 + 10))
+            contours2b, _ = cv2.findContours(edges2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            large_contours = [c for c in contours2b if cv2.contourArea(c) >= large_area]
+
+            try:
+                if os.environ.get("UBEND_DEBUG"):
+                    print("find_oring: fallback contours after morph=", len(contours2b), "large_after=", len(large_contours))
+                    cv2.imwrite("/tmp/oring_smoothed.png", smoothed)
+                    cv2.imwrite("/tmp/oring_edges.png", edges)
+                    cv2.imwrite("/tmp/oring_edges2.png", edges2)
+            except Exception:
+                pass
+
         overlay = img.copy()
         if large_contours:
-            cv2.drawContours(overlay, large_contours, -1, (0, 0, 200), 5)
+            cv2.drawContours(overlay, large_contours, -1, (0, 200, 0), 5)
         p = cv2.addWeighted(img, 0.7, overlay, 0.5, 0)
         hh, ww = p.shape[:2]
         x_mid = ww // 2
@@ -551,7 +688,7 @@ class HomePage(QWidget):
             y_at_x_max = int(np.median(pts_zone[pts_zone[:, 0] == x_max][:, 1])) if np.any(pts_zone[:, 0] == x_max) else int(np.median(pts_zone[:, 1]))
             avg_y = (y_at_x_min + y_at_x_max) // 2
             rect_width = x_max - x_min
-            rect_height = max(1, int(0.5 * rect_width))
+            rect_height = max(1, int(rect_height_ratio * rect_width))
             top_y = max(0, avg_y - rect_height // 2)
             bottom_y = min(hh - 1, avg_y + rect_height // 2)
             diff_val = abs(avg_y - y_max)
@@ -572,6 +709,14 @@ class HomePage(QWidget):
         else:
             top_color = (0, 255, 255)
         cv2.putText(p, summary, (10, 30), font, 0.8, top_color, 2, cv2.LINE_AA)
+        try:
+            self.oring_status.emit(s1, s2)
+        except Exception:
+            pass
+        try:
+            self.emit_summary.emit(summary)
+        except Exception:
+            pass
         try:
             self.result_label.setText(summary)
         except Exception:

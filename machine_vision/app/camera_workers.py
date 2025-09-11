@@ -2,6 +2,7 @@ import sys
 import os
 import struct
 import cv2
+from MvImport.CameraParams_header import MV_CC_DEVICE_INFO_LIST
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
@@ -127,6 +128,9 @@ class HikrobotCameraWorker(QThread):
         try:
             # enumerate devices (support GigE & USB)
             deviceList = MV_CC_DEVICE_INFO_LIST()
+            # find ip
+            
+            
             tlayerType = (MV_GIGE_DEVICE | MV_USB_DEVICE)
             ret = MvCamera.MV_CC_EnumDevices(tlayerType, deviceList)
             if ret != 0:
@@ -162,8 +166,12 @@ class HikrobotCameraWorker(QThread):
                 # use SDK constants if available; fallback numeric if not
                 self.cam.MV_CC_SetEnumValue("TriggerMode", 1)           # 1 = On
                 self.cam.MV_CC_SetEnumValue("TriggerSource", 0)         # 0 = Line0
-                self.cam.MV_CC_SetEnumValue("TriggerActivation", 2)     # 0 = RisingEdge
+                self.cam.MV_CC_SetEnumValue("TriggerActivation", 0)     # 0 = RisingEdge
                 self.cam.MV_CC_SetEnumValue("PixelFormat", 0x02180014)  # PixelType_RGB8_Packed
+                #Exposure time
+                self.cam.MV_CC_SetIntValue("ExposureTime", 100000)  # Set exposure time to 50000us
+                #trigger delay set
+                self.cam.MV_CC_SetIntValue("TriggerDelay", 100)  # Set trigger delay to 1000us
             except Exception:
                 try:
                     self.cam.MV_CC_SetEnumValue("TriggerMode", 0)

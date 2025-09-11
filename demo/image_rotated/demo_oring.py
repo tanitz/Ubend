@@ -4,8 +4,8 @@ import glob
 import os
 import time
 
-IMAGE_DIR = '/home/snc/Documents/Ubend/machine_vision/image_rotated'
-
+IMAGE_DIR = '/home/snc/Documents/Ubend/demo/img'
+# IMAGE_DIR = '/home/snc/Documents/Ubend/machine_vision/image_rotated'
 def find_oring(image: np.ndarray,
                min_area: int = 500,
                delta: int = 20,
@@ -25,35 +25,51 @@ def find_oring(image: np.ndarray,
     # 1) สร้าง mask เบื้องต้นจากช่อง S (Saturation) และ inpaint
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
-    s_increased = cv2.add(s, 10)
+    s_increased = cv2.add(v, 5)
 
     _, object_mask = cv2.threshold(s_increased, 0, 100, cv2.THRESH_BINARY)
     _, hole_mask = cv2.threshold(s_increased, 100, 255, cv2.THRESH_BINARY_INV)
     inpaint_mask = cv2.bitwise_and(object_mask, hole_mask)
+    # cv2.imshow("inpaint_mask", inpaint_mask)
     try:
         _ = cv2.inpaint(s_increased, inpaint_mask, 1, cv2.INPAINT_NS)
     except Exception:
         pass
 
     contours, _ = cv2.findContours(inpaint_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    filled = np.zeros_like(inpaint_mask)
-    if contours:
-        cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
+    
+    # filled = np.zeros_like(inpaint_mask)
+    
+    # if contours:
+    #     cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
+    
 
     # 2) ทำให้ mask เนียนขึ้น
-    blurred = cv2.GaussianBlur(filled, (15, 15), 0)
-    _, smoothed = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
-    contours2, _ = cv2.findContours(smoothed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blurred = cv2.GaussianBlur(inpaint_mask, (15, 15), 0)
+    _, smoothed = cv2.threshold(blurred, 40, 255, cv2.THRESH_BINARY)
+    edges = cv2.Canny(smoothed, 50, 150)
 
-    # 3) เลือกเฉพาะคอนทัวร์ใหญ่
+    contours2, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # cv2.drawContours(img, contours2, -1, (0, 255, 0), 2)
+    # cv2.imshow("filled", edges)
+
+    # --- added: compute and print contour areas ---
+    contour_areas = [cv2.contourArea(c) for c in contours2]
+    if contour_areas:
+        print("contour areas (px):", sorted([float(f) for f in contour_areas], reverse=True))
+    else:
+        print("no contours found")
+    # ----------------------------------------------
+
+    # 3) เลือกเฉพาะคอนทัวร์ใหญ่ (ใช้ min_area จากอาร์กิวเมนต์)
     large_contours = [c for c in contours2 if cv2.contourArea(c) >= min_area]
 
     # 4) วาดเส้นขอบชิ้นงานทับบนภาพต้นฉบับ แล้ว blend ให้เห็นชัด
     overlay = img.copy()
     if large_contours:
-        cv2.drawContours(overlay, large_contours, -1, (0, 0, 200), 5)
+        cv2.drawContours(overlay, large_contours, -1, (0, 200, 0), 5)
     p = cv2.addWeighted(img, 0.7, overlay, 0.5, 0)
+    cv2.imshow("contours", p)
 
     # 5) วิเคราะห์เฉพาะโซนล่าง (3 และ 4) และวาดกล่อง/ข้อความผลลัพธ์บน p
     hh, ww = p.shape[:2]

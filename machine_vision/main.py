@@ -11,8 +11,8 @@ from PySide6.QtCore import Qt # type: ignore
 # ตรวจสอบให้แน่ใจว่าคุณมีไฟล์เหล่านี้อยู่ในโฟลเดอร์เดียวกัน
 from app.ui.home_page import HomePage
 from app.ui.setting_page import SettingPage
-from app.ui.io_page import IoPage
 from app.ui.config_page import ConfigPage 
+from app.ui.report_page import ReportPage
 from app.config_manager import ConfigManager
 
 # --- คลาสหน้าต่างหลัก ---
@@ -22,75 +22,50 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Machine Vision Ubend")
         self.setWindowIcon(QIcon("icon.png"))
         self.config = ConfigManager()
-        # --- ส่วนจัดการรหัสผ่าน ---
+
+        # password/lock settings
         self.PASSWORD = "1234"
         self.is_unlocked = False
         self.is_checking_password = False
-        self.locked_tabs_indices = {1, 2, 3}
-
+        # lock SETTINGS (2), CONNECTION (3), EXIT (4). Report (index 1) is unlocked
+        self.locked_tabs_indices = {2, 3, 4}
         self.unlock_timestamp = 0
         self.LOCK_DURATION = 10
 
-        # --- สร้างและตั้งค่า QTabWidget ---
+        # tabs
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.West)
-        self.tabs.tabBar().setExpanding(True) # คำสั่งนี้ถูกต้องแล้ว
+        self.tabs.tabBar().setExpanding(True)
 
-        # --- เพิ่มหน้าต่างๆ โดยใช้คลาสที่ Import มา ---
-        self.tabs.addTab(HomePage(self.config), "HOME")
-        self.tabs.addTab(SettingPage(), "SETTINGS")
-        self.tabs.addTab(IoPage(), "I/O")
-        self.tabs.addTab(ConfigPage(self.config), "CONNECTION")
-        self.tabs.addTab(QWidget(), "EXIT")
+        # create pages
+        self.home_page = HomePage(self.config)
+        self.report_page = ReportPage()
+        self.setting_page = SettingPage()
+        self.config_page = ConfigPage(self.config)
 
-        # --- ตั้งค่า Stylesheet (ฉบับแก้ไขเพื่อให้แท็บขยายได้) ---
-        self.tabs.setStyleSheet("""
-            /* พื้นหลังส่วนเนื้อหาของ Tab */
-            QTabWidget::pane {
-                border: none;
-                background-color: #FFFFFF;
-            }
+        # connect signals (Home -> Setting)
+        self.home_page.oring_status.connect(self.setting_page.update_oring)
+        self.home_page.emit_summary.connect(self.setting_page.parse_and_update)
 
-            /* แถบ Tab ทั้งหมด (พื้นที่ด้านข้าง) */
-            QTabBar {
-                background-color: #FFFFFF; /* 🎯 ทำให้พื้นหลังเป็นสีขาว */
-                min-width: 50px;
-                min-height: 50px;
-                border: none;
-                /* เพิ่มเส้นคั่นด้านขวาของแถบทั้งหมด */
-                border-right: 2px solid #F0F0F0;
-            }
+        # add tabs
+        self.tabs.addTab(self.home_page, "HOME")           # index 0
+        self.tabs.addTab(self.report_page, "REPORT")       # index 1 (unlocked)
+        self.tabs.addTab(self.setting_page, "SETTINGS")    # index 2 (locked)
+        self.tabs.addTab(self.config_page, "CONNECTION")   # index 3 (locked)
+        self.tabs.addTab(QWidget(), "EXIT")                # index 4 (locked)
 
-            /* ปุ่มแท็บแต่ละอัน */
-            QTabBar::tab {
-                background-color: transparent; /* ทำให้พื้นหลังโปร่งใสในสถานะปกติ */
-                color: #333333;
-                padding: 56px 14px; /* 🎯 เพิ่ม padding แนวตั้งเพื่อให้ดู 'ยาวขึ้น' */
-                font-size: 16px;
-                font-weight: bold;
-                border: none; /* เอาเส้นขอบรอบปุ่มออก */
-            }
-            
-            /* ปุ่มแท็บที่กำลังถูกเลือก */
-            QTabBar::tab:selected {
-                background-color: #003366;
-                color: #FFFFFF;
-            }
-
-            /* ปุ่มแท็บเมื่อเมาส์ชี้อยู่ */
-            QTabBar::tab:hover {
-                background-color: #E0F2FF;
-            }
-             /* 🎯 เพิ่มสไตล์พิเศษสำหรับปุ่ม EXIT (แท็บสุดท้าย) */
-            QTabBar::tab:last {
-                background-color: #D32F2F; /* สีแดงเข้ม */
-                color: white;
-            }
-            QTabBar::tab:last:hover {
-                background-color: #F44336; /* สีแดงสว่างขึ้นเมื่อเมาส์ชี้ */
-            }                    
-
-        """)
+        # stylesheet
+        self.tabs.setStyleSheet(
+            """
+            QTabWidget::pane { border: none; background-color: #FFFFFF; }
+            QTabBar { background-color: #FFFFFF; min-width: 50px; min-height: 50px; border: none; border-right: 2px solid #F0F0F0; }
+            QTabBar::tab { background-color: transparent; color: #333333; padding: 76px 14px; font-size: 16px; font-weight: bold; border: none; }
+            QTabBar::tab:selected { background-color: #003366; color: #FFFFFF; }
+            QTabBar::tab:hover { background-color: #E0F2FF; }
+            QTabBar::tab:last { background-color: #D32F2F; color: white; }
+            QTabBar::tab:last:hover { background-color: #F44336; }
+            """
+        )
 
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.setCentralWidget(self.tabs)
