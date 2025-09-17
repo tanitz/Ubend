@@ -59,7 +59,7 @@ class MainWindow(QMainWindow):
             """
             QTabWidget::pane { border: none; background-color: #FFFFFF; }
             QTabBar { background-color: #FFFFFF; min-width: 50px; min-height: 50px; border: none; border-right: 2px solid #F0F0F0; }
-            QTabBar::tab { background-color: transparent; color: #333333; padding: 76px 14px; font-size: 16px; font-weight: bold; border: none; }
+            QTabBar::tab { background-color: transparent; color: #333333; padding: 73px 14px; font-size: 16px; font-weight: bold; border: none; }
             QTabBar::tab:selected { background-color: #003366; color: #FFFFFF; }
             QTabBar::tab:hover { background-color: #E0F2FF; }
             QTabBar::tab:last { background-color: #D32F2F; color: white; }
