@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ubend Machine Vision
+Comment=Run Ubend machine vision app
+Exec=/bin/bash -ic "cd /home/snc/Documents/Ubend/machine_vision && ./run_app.sh;"
+Path=/home/snc/Documents/Ubend/machine_vision
+Icon=/home/snc/Documents/Ubend/machine_vision/iconMV.png
+Terminal=true
+Categories=Utility;

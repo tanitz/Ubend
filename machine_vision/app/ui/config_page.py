@@ -46,7 +46,7 @@ class ConfigPage(QWidget):
         main_layout = QVBoxLayout(self)
         title = QLabel("CONNECTION")
         title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #003366;")
+        title.setStyleSheet("font-size: 50px; font-weight: bold; color: #003366;")
         main_layout.addWidget(title)
         main_layout.addWidget(camera_group_box)
         main_layout.addWidget(self.save_button)

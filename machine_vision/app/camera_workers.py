@@ -169,9 +169,9 @@ class HikrobotCameraWorker(QThread):
                 self.cam.MV_CC_SetEnumValue("TriggerActivation", 0)     # 0 = RisingEdge
                 self.cam.MV_CC_SetEnumValue("PixelFormat", 0x02180014)  # PixelType_RGB8_Packed
                 #Exposure time
-                self.cam.MV_CC_SetIntValue("ExposureTime", 100000)  # Set exposure time to 50000us
+                self.cam.MV_CC_SetIntValue("ExposureTime", 5000)  # Set exposure time to 500us
                 #trigger delay set
-                self.cam.MV_CC_SetIntValue("TriggerDelay", 100)  # Set trigger delay to 1000us
+                self.cam.MV_CC_SetIntValue("TriggerDelay", 1)  # Set trigger delay to 1us
             except Exception:
                 try:
                     self.cam.MV_CC_SetEnumValue("TriggerMode", 0)

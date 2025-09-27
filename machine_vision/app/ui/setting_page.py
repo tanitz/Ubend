@@ -1,22 +1,31 @@
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QLineEdit, QPushButton, QFormLayout,
-    QGroupBox, QGridLayout, QSizePolicy, QSpinBox, QHBoxLayout, QLayout
+    QGroupBox, QGridLayout, QSizePolicy, QSpinBox, QHBoxLayout, QLayout, QCheckBox,
+    QComboBox                                          # <-- added
 )
 from PySide6.QtCore import Qt
 import configparser
 import os
 from PySide6.QtGui import QIntValidator, QDoubleValidator, QFont
+# --- new imports for serial listing ---
+import glob
+try:
+    import serial
+    import serial.tools.list_ports as list_ports
+except ImportError:
+    serial = None
+    list_ports = None
 
 class SettingPage(QWidget):
     def __init__(self, data_count: int = 2,
                  plc_addr_start: int = 0, plc_addr_step: int = 2,
                  data_default: str = "NA", row_spacing: int = 22):
         super().__init__()
-        self.config_file = 'config.ini'
+        # use same config.ini path as other modules (machine_vision/config.ini)
+        self.config_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.ini"))
         self.config = configparser.ConfigParser()
         self.load_config()
 
-        
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 4, 4)
         layout.setSpacing(6)
@@ -24,7 +33,7 @@ class SettingPage(QWidget):
 
         title = QLabel("SETTINGS")
         title.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #003366;")
+        title.setStyleSheet("font-size: 50px; font-weight: bold; color: #003366;")
         layout.addWidget(title)
         
         # Group box for O-ring settings
@@ -76,6 +85,76 @@ class SettingPage(QWidget):
         form_layout.addRow(QLabel("Rect height ratio:"), self.rect_ratio_input)
 
         layout.addWidget(oring_group)
+
+        # --- Report group: choice to save images in report ---
+        report_group = QGroupBox("REPORT")
+        report_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
+        report_group.setFixedWidth(420)
+        report_layout = QHBoxLayout(report_group)
+        self.save_reports_checkbox = QCheckBox("Save images for report")
+        # read boolean from config file (fallback True)
+        save_images_default = self.config.getboolean('report', 'save_images', fallback=True)
+        self.save_reports_checkbox.setChecked(bool(save_images_default))
+        report_layout.addWidget(self.save_reports_checkbox)
+        report_layout.addStretch()
+        layout.addWidget(report_group)
+        # --- end report group ---
+
+        # --- SERIAL / MODBUS group ---
+        serial_group = QGroupBox("SERIAL / MODBUS")
+        serial_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
+        serial_group.setFixedWidth(420)
+        s_form = QFormLayout(serial_group)
+
+        # Port selection + refresh
+        port_row = QHBoxLayout()
+        self.serial_port_combo = QComboBox()
+        self.serial_port_combo.setMinimumWidth(180)
+        self.serial_refresh_btn = QPushButton("Refresh")
+        self.serial_refresh_btn.setFixedWidth(70)
+        self.serial_refresh_btn.clicked.connect(self.populate_serial_ports)
+        port_row.addWidget(self.serial_port_combo)
+        port_row.addWidget(self.serial_refresh_btn)
+        port_row.addStretch()
+        port_row_w = QWidget()
+        port_row_w.setLayout(port_row)
+        s_form.addRow(QLabel("Port:"), port_row_w)
+
+        # Baudrate
+        self.serial_baud_combo = QComboBox()
+        self.serial_baud_combo.addItems(["9600","19200","38400","57600","115200"])
+        s_form.addRow(QLabel("Baud:"), self.serial_baud_combo)
+
+        # Parity
+        self.serial_parity_combo = QComboBox()
+        self.serial_parity_combo.addItems(["NONE","EVEN","ODD","MARK","SPACE"])
+        s_form.addRow(QLabel("Parity:"), self.serial_parity_combo)
+
+        # Stop bits
+        self.serial_stopbits_combo = QComboBox()
+        self.serial_stopbits_combo.addItems(["1","1.5","2"])
+        s_form.addRow(QLabel("Stop Bits:"), self.serial_stopbits_combo)
+
+        # Data bits
+        self.serial_bytesize_combo = QComboBox()
+        self.serial_bytesize_combo.addItems(["7","8"])
+        s_form.addRow(QLabel("Data Bits:"), self.serial_bytesize_combo)
+
+        # Slave ID
+        self.modbus_slave_spin = QSpinBox()
+        self.modbus_slave_spin.setRange(1,247)
+        self.modbus_slave_spin.setValue(1)
+        self.modbus_slave_spin.setFixedWidth(80)
+        s_form.addRow(QLabel("Slave ID:"), self.modbus_slave_spin)
+
+        # Test button
+        self.serial_test_btn = QPushButton("Test Connect")
+        self.serial_test_btn.setFixedWidth(120)
+        self.serial_test_btn.clicked.connect(self.test_serial_connection)
+        s_form.addRow(QLabel(""), self.serial_test_btn)
+
+        layout.addWidget(serial_group)
+        # --- end SERIAL / MODBUS group ---
 
         # --- I/O Page content integration ---
         self.data_count = max(1, data_count)
@@ -134,6 +213,12 @@ class SettingPage(QWidget):
         layout.addWidget(self.save_button)
         layout.addStretch()
 
+        # ensure at least first two rows exist (DATA1 / DATA2) for mapping OK / NG
+        if self.data_count < 2:
+            self.set_data_count(2)
+        # apply serial config after widgets created
+        self._apply_serial_config()
+
     def load_config(self):
         if os.path.exists(self.config_file):
             self.config.read(self.config_file)
@@ -148,6 +233,19 @@ class SettingPage(QWidget):
                 'canny_thresh2': '90',
                 'morph_kernel': '15',
                 'rect_height_ratio': '0.5'
+            }
+            # default report section
+            self.config['report'] = {
+                'save_images': 'true'
+            }
+        if not self.config.has_section('serial'):
+            self.config['serial'] = {
+                'port': '',
+                'baudrate': '9600',
+                'parity': 'NONE',
+                'stopbits': '1',
+                'bytesize': '8',
+                'slave_id': '1'
             }
 
     def save_config(self):
@@ -164,6 +262,21 @@ class SettingPage(QWidget):
         self.config['find_oring']['canny_thresh2'] = self.canny2_input.text()
         self.config['find_oring']['morph_kernel'] = self.morph_kernel_input.text()
         self.config['find_oring']['rect_height_ratio'] = self.rect_ratio_input.text()
+
+        # report section
+        if not self.config.has_section('report'):
+            self.config.add_section('report')
+        self.config['report']['save_images'] = 'true' if self.save_reports_checkbox.isChecked() else 'false'
+
+        # serial section
+        if not self.config.has_section('serial'):
+            self.config.add_section('serial')
+        self.config['serial']['port'] = self.serial_port_combo.currentText().strip()
+        self.config['serial']['baudrate'] = self.serial_baud_combo.currentText()
+        self.config['serial']['parity'] = self.serial_parity_combo.currentText()
+        self.config['serial']['stopbits'] = self.serial_stopbits_combo.currentText()
+        self.config['serial']['bytesize'] = self.serial_bytesize_combo.currentText()
+        self.config['serial']['slave_id'] = str(self.modbus_slave_spin.value())
 
         with open(self.config_file, 'w') as configfile:
             self.config.write(configfile)
@@ -366,3 +479,107 @@ class SettingPage(QWidget):
                 # This will catch errors if the key is not in the format "data<number>"
                 # and prevent the program from crashing.
                 pass
+
+    # --- new helpers for serial ---
+    def populate_serial_ports(self):
+        ports = []
+        if list_ports:
+            try:
+                ports = [p.device for p in list_ports.comports()]
+            except Exception:
+                ports = []
+        if not ports:
+            # fallback glob common linux device names
+            ports = sorted(glob.glob("/dev/ttyUSB*")) + sorted(glob.glob("/dev/ttyACM*"))
+        current = self.serial_port_combo.currentText()
+        self.serial_port_combo.blockSignals(True)
+        self.serial_port_combo.clear()
+        if ports:
+            self.serial_port_combo.addItems(ports)
+        else:
+            self.serial_port_combo.addItem("")
+        # restore selection if still present
+        if current and current in ports:
+            idx = self.serial_port_combo.findText(current)
+            if idx >= 0:
+                self.serial_port_combo.setCurrentIndex(idx)
+        self.serial_port_combo.blockSignals(False)
+
+    def _apply_serial_config(self):
+        if not self.config.has_section('serial'):
+            return
+        sec = self.config['serial']
+        port = sec.get('port', '')
+        self.populate_serial_ports()
+        if port:
+            idx = self.serial_port_combo.findText(port)
+            if idx >= 0:
+                self.serial_port_combo.setCurrentIndex(idx)
+            else:
+                # add custom port if not listed
+                self.serial_port_combo.addItem(port)
+                self.serial_port_combo.setCurrentText(port)
+        self.serial_baud_combo.setCurrentText(sec.get('baudrate','9600'))
+        self.serial_parity_combo.setCurrentText(sec.get('parity','NONE').upper())
+        self.serial_stopbits_combo.setCurrentText(sec.get('stopbits','1'))
+        self.serial_bytesize_combo.setCurrentText(sec.get('bytesize','8'))
+        try:
+            self.modbus_slave_spin.setValue(int(sec.get('slave_id','1')))
+        except ValueError:
+            pass
+
+    def test_serial_connection(self):
+        port = self.serial_port_combo.currentText().strip()
+        if not port:
+            QMessageBox.information(self, "Serial Test", "No port selected.")
+            return
+        if serial is None:
+            QMessageBox.warning(self, "Serial Test", "pyserial not installed (pip install pyserial).")
+            return
+        baud = int(self.serial_baud_combo.currentText())
+        parity_map = {
+            "NONE": serial.PARITY_NONE,
+            "EVEN": serial.PARITY_EVEN,
+            "ODD": serial.PARITY_ODD,
+            "MARK": serial.PARITY_MARK,
+            "SPACE": serial.PARITY_SPACE
+        }
+        stopbits_map = {"1": serial.STOPBITS_ONE, "1.5": serial.STOPBITS_ONE_POINT_FIVE, "2": serial.STOPBITS_TWO}
+        bytesize_map = {"7": serial.SEVENBITS, "8": serial.EIGHTBITS}
+        try:
+            ser = serial.Serial(
+                port=port,
+                baudrate=baud,
+                parity=parity_map.get(self.serial_parity_combo.currentText(), serial.PARITY_NONE),
+                stopbits=stopbits_map.get(self.serial_stopbits_combo.currentText(), serial.STOPBITS_ONE),
+                bytesize=bytesize_map.get(self.serial_bytesize_combo.currentText(), serial.EIGHTBITS),
+                timeout=1
+            )
+            if ser.is_open:
+                ser.close()
+            QMessageBox.information(self, "Serial Test", f"Open OK: {port}")
+        except Exception as e:
+            QMessageBox.critical(self, "Serial Test", f"Failed: {e}")
+
+    def update_from_classification(self, classification: str):
+        """Map machine vision classification to DATA1 / DATA2.
+        DATA1 shows OK status when classification == OK else NA.
+        DATA2 shows NG status when classification == NG else NA.
+        """
+        classification = (classification or "NA").upper()
+        updates = {}
+        if "data1" not in self.widgets:
+            self._ensure_row_for_key("data1")
+        if "data2" not in self.widgets:
+            self._ensure_row_for_key("data2")
+
+        if classification == "OK":
+            updates["data1"] = "OK"
+            updates["data2"] = "NA"
+        elif classification == "NG":
+            updates["data1"] = "NA"
+            updates["data2"] = "NG"
+        else:
+            updates["data1"] = "NA"
+            updates["data2"] = "NA"
+        self._apply_statuss_loop(updates)
