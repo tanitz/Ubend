@@ -1,5 +1,6 @@
 import sys
 import os
+import traceback
 import configparser
 import time
 import csv
@@ -8,21 +9,16 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import (
     QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
-    QFileDialog, QSizePolicy, QGroupBox ,QGridLayout
+    QFileDialog, QSizePolicy, QGroupBox ,QGridLayout, QComboBox
 )
-from PySide6.QtCore import Qt, QPoint, QRect, QEvent, Signal, QTimer
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QFont
+from PySide6.QtCore import Qt, QPoint, QRect, QEvent, Signal, QTimer, QSize
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QFont, QIcon
 from PySide6.QtWidgets import QApplication
 import app.matching
-from app import storage
-try:
-    demo_match_path = "/home/snc/Documents/DEMO/opencv_matching"
-    if demo_match_path not in sys.path:
-        sys.path.append(demo_match_path)
-    import matching2 as tm_matching   # wrapper for native matcher
-except Exception as _e:
-    tm_matching = None
-    print("WARNING: matching2 import failed:", _e)
+from app.part_matcher import PartMatcher          # native matcher: every part of the frame, NaN-safe (native/ folder)
+from app.oring_v2 import find_oring_v2, make_montage
+from app.oring_settings import load_settings
+from app import model_store, storage
 from app.camera_workers import USBCameraWorker, HikrobotCameraWorker
 import configparser
 from dataclasses import dataclass
@@ -180,11 +176,25 @@ class ImagePlaceholder(QLabel):
         return QRect(ox, oy, ow, oh)
 
 
+class ModelComboBox(QComboBox):
+    """MODEL drop-down: the list is re-scanned every time it is opened (a file copied into model/ shows up at once)."""
+    aboutToOpen = Signal()
+
+    def showPopup(self):
+        self.aboutToOpen.emit()
+        super().showPopup()
+        self.view().setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)    # visible scroll bar (Qt hides it); the mouse wheel works too
+
+
+IMPORT_ITEM = "__import__"   # data of the last entry of the MODEL list ("Import from file...")
+
+
 class HomePage(QWidget):
     """Main page: uses Hikrobot (or USB) camera as source and provides matching UI."""
     oring_status = Signal(str, str)
     emit_summary = Signal(str)
     classification_emitted = Signal(str) 
+    parts_evaluated = Signal(list)     # per frame: [dict(part, crop, cls, info)] for the SETTINGS page preview / statistics
     def __init__(self, config_manager=None):
         super().__init__()
         # ใช้ config_manager ที่ส่งมา ถ้าเป็น None ให้ใช้ singleton ที่โหลด .ini เมื่อเริ่มโปรแกรม
@@ -201,8 +211,15 @@ class HomePage(QWidget):
         self.count_na = 0
         self.count_total = 0
 
-        self._matcher = None
+        self._matcher = None            # kept as an alias of _part_matcher for older code
+        self._part_matcher = None       # app.part_matcher.PartMatcher of the current template
         self._template_size = None  # (w,h)
+        self.current_model_name = None  # file name in model/ of the template in use (None = unsaved crop / outside model/)
+        self._icon_cache = {}
+        self.last_results = []
+        # OK/NG judgement settings (SETTINGS page -> apply_oring_settings)
+        self.oring_settings = load_settings()
+        self._params = self.oring_settings.to_params()
 
         # TCP settings
         self.tcp_enabled = False
@@ -235,21 +252,29 @@ class HomePage(QWidget):
         # Widgets ส่วนควบคุม (Controls)
         self.start_button = QPushButton("START CAMERA")
         self.crop_button = QPushButton("MATCHING CROP")
-        self.open_template_button = QPushButton("OPEN TEMPLATE")
+        self.model_combo = ModelComboBox()
         self.run_match_button = QPushButton("RUN")
         # ปุ่มจากตัวอย่างแรก (ถ้าต้องการใช้)
         # self.load_template_button = QPushButton("LOAD TEMPLATE")
 
         # ตั้งค่าปุ่ม
         self.crop_button.setCheckable(True)
-        self.open_template_button.setEnabled(False)
         self.run_match_button.setCheckable(True)           # ทำปุ่มเป็น toggle
         self.run_match_button.setEnabled(True)             # อนุญาตให้กดได้เลย (ไม่ต้องรอเปิดกล้อง/มีเทมเพลต)
 
         # ปรับขนาดและสไตล์ปุ่มให้ใหญ่ขึ้น
         btn_font = QFont()
         btn_font.setPointSize(11)  # ปรับขนาดตัวอักษร
-        for b in (self.start_button, self.crop_button, self.open_template_button, self.run_match_button):
+        self.model_combo.setFont(btn_font)
+        self.model_combo.setMinimumHeight(48)
+        self.model_combo.setMinimumWidth(140)
+        self.model_combo.setIconSize(QSize(56, 40))
+        self.model_combo.setMaxVisibleItems(6)      # the popup shows 6 models at a time; the rest scrolls (mouse wheel / scroll bar)
+        self.model_combo.setStyleSheet("QComboBox { combobox-popup: 0; }")   # plain scrollable list instead of a full-height popup
+        self.model_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.model_combo.setPlaceholderText("MODEL: (none)")
+        self.model_combo.setToolTip("เลือก template (model) ที่ใช้จับคู่ชิ้นงาน - ไฟล์อยู่ในโฟลเดอร์ model/")
+        for b in (self.start_button, self.crop_button, self.run_match_button):
             b.setFont(btn_font)
             b.setMinimumHeight(44)                  # ความสูงขั้นต่ำของปุ่ม
             b.setMinimumWidth(140)                  # ความกว้างขั้นต่ำ (ถ้าต้องการ)
@@ -300,7 +325,7 @@ class HomePage(QWidget):
         controls_grid_layout = QGridLayout()
         controls_grid_layout.addWidget(self.start_button, 0, 0)
         controls_grid_layout.addWidget(self.crop_button, 0, 1)
-        controls_grid_layout.addWidget(self.open_template_button, 1, 0)
+        controls_grid_layout.addWidget(self.model_combo, 1, 0)
         controls_grid_layout.addWidget(self.run_match_button, 1, 1)
         controls_group.setLayout(controls_grid_layout)
         
@@ -370,48 +395,17 @@ class HomePage(QWidget):
         # ======================================================================
         self.start_button.clicked.connect(self.toggle_camera)
         self.crop_button.toggled.connect(self.toggle_crop_mode)
-        self.open_template_button.clicked.connect(self.open_template)
+        self.model_combo.activated.connect(self._on_model_activated)
+        self.model_combo.aboutToOpen.connect(self._refresh_models)
         self.run_match_button.toggled.connect(self.toggle_auto_match)
         # (Removed QTimer auto loop)
         self.auto_match_enabled = False
         self.matching_running = False
         self.destroyed.connect(self.cleanup)
 
-        # load default template from machine_vision/temp.jpg (if exists)
-        try:
-            config = configparser.ConfigParser()
-            # Correct search order: project root, sibling (legacy), local (last)
-            cfg_paths = [
-                os.path.join(os.path.dirname(__file__), "..", "..", "config.ini"),   # machine_vision/config.ini
-                os.path.join(os.path.dirname(__file__), "..", "config.ini"),         # (legacy) machine_vision/app/config.ini
-                os.path.join(os.path.dirname(__file__), "config.ini")                # local fallback
-            ]
-            existing = [os.path.abspath(p) for p in cfg_paths if os.path.exists(os.path.abspath(p))]
-            if existing:
-                config.read(existing)
-            template_name = "temp.jpg"
-            if config.has_section("find_oring"):
-                template_name = config.get("find_oring", "template_file", fallback=template_name)
-
-            if os.path.isabs(template_name):
-                default_template_path = template_name
-            else:
-                # resolve relative to project root (two levels up)
-                default_template_path = os.path.abspath(
-                    os.path.join(os.path.dirname(__file__), "..", "..", template_name)
-                )
-
-            if os.path.exists(default_template_path):
-                tpl = cv2.imread(default_template_path)
-                if tpl is not None:
-                    self.template_cv_image = tpl
-                    self.image2.set_cv_image(self.template_cv_image, is_original=True)
-                    self.open_template_button.setEnabled(True)
-                    self.result_label.setText(f"Template loaded: {os.path.basename(default_template_path)}")
-        except Exception:
-            # keep silent to avoid UI crash; optionally add debug print if needed
-            if os.environ.get("UBEND_DEBUG"):
-                print("DEBUG: failed loading default template", flush=True)
+        # template at start-up: [find_oring] template_file (model/ first, then the old location)
+        self._populate_models()
+        self._load_default_template()
 
         # โหลดยอดนับของวันนี้จากไฟล์ report (OK/NG/NA)
         self._load_today_counters()
@@ -440,11 +434,14 @@ class HomePage(QWidget):
             os.makedirs(month_dir, exist_ok=True)
         return month_dir
 
-    def _save_report_entry(self, input_img: np.ndarray, output_img: np.ndarray, test_result: str = "") -> None:
+    def _save_report_entry(self, input_img: np.ndarray, output_img: np.ndarray, test_result: str = "",
+                           shared_input: str = None):
         """Save input/output images + a CSV row: index,time,result,input_image,output_image
-           test_result ต้องเป็นหนึ่งใน OK / NG / NA"""
+           test_result ต้องเป็นหนึ่งใน OK / NG / NA
+           One row per part. The parts of one frame pass the returned input path back as `shared_input`, so the
+           (big) input image is written once. Returns the input image path (None when nothing was saved)."""
         if input_img is None or output_img is None:
-            return
+            return None
 
         # Check config.ini report.save_images flag; if false, skip saving
         try:
@@ -460,7 +457,7 @@ class HomePage(QWidget):
 
         if not save_images:
             # User disabled report image saving
-            return
+            return None
 
         month_dir = self._get_report_month_dir()
         now = datetime.now()
@@ -507,13 +504,15 @@ class HomePage(QWidget):
         stamp = now.strftime("%Y%m%d_%H%M%S_%f")[:-3]
         in_name = f"{index_val:07d}_{stamp}_input.jpg"
         out_name = f"{index_val:07d}_{stamp}_output.jpg"
-        in_path = os.path.join(images_dir, in_name)
+        reuse_input = bool(shared_input) and os.path.exists(shared_input)
+        in_path = shared_input if reuse_input else os.path.join(images_dir, in_name)
         out_path = os.path.join(images_dir, out_name)
         try:
-            cv2.imwrite(in_path, input_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not reuse_input:
+                cv2.imwrite(in_path, input_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             cv2.imwrite(out_path, output_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
         except Exception:
-            return
+            return None
         try:
             with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -524,6 +523,7 @@ class HomePage(QWidget):
         except Exception:
             # Silently ignore CSV errors to avoid UI interruption
             pass
+        return in_path
 
     def _load_today_counters(self):
         """อ่านไฟล์ report.csv ของเดือนปัจจุบัน แล้วรวมเฉพาะแถวของวันที่วันนี้ (result = OK/NG/NA)."""
@@ -620,59 +620,230 @@ class HomePage(QWidget):
         cv2.imwrite(path, self.template_cv_image)
         self.result_label.setText(f"Template saved: {os.path.basename(path)}")
 
-    def open_template(self):
-        """Open an existing template image from disk and load it as the current template."""
+    # -------------------------------------------------------------
+    # MODEL (template) drop-down: the image files of machine_vision/model/
+    # -------------------------------------------------------------
+    def _model_icon(self, path: str) -> QIcon:
+        """Thumbnail of a model file (cached by file time)."""
+        try:
+            key = (path, os.path.getmtime(path))
+        except OSError:
+            return QIcon()
+        icon = self._icon_cache.get(key)
+        if icon is None:
+            img = cv2.imread(path)
+            if img is None:
+                return QIcon()
+            h = 48
+            img = cv2.resize(img, (max(1, int(img.shape[1] * h / img.shape[0])), h), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QImage.Format_RGB888).copy()
+            icon = QIcon(QPixmap.fromImage(qimg))
+            self._icon_cache[key] = icon
+        return icon
+
+    def _populate_models(self, select=None):
+        """(Re)fill the MODEL list from model/ and show `select` (default: the model in use) without reloading it."""
+        want = select or self.current_model_name
+        combo = self.model_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for name in model_store.list_models():
+            path = model_store.resolve_model_path(name)
+            w, h = model_store.image_size(path)
+            combo.addItem(self._model_icon(path), f"{name}   ({w}×{h})", name)
+            tip = f"{path}\n{w}×{h} px" + ("\n⚠ เล็กกว่าชิ้นงาน อาจได้ NA มาก" if model_store.is_small((w, h)) else "")
+            combo.setItemData(combo.count() - 1, tip, Qt.ToolTipRole)
+        combo.addItem("＋  Import from file…", IMPORT_ITEM)
+        combo.setCurrentIndex(combo.findData(want) if want else -1)
+        combo.blockSignals(False)
+
+    def _refresh_models(self):
+        self._populate_models()
+
+    def _on_model_activated(self, index: int):
+        data = self.model_combo.itemData(index)
+        if data == IMPORT_ITEM:
+            self._import_model_dialog()
+        elif data:
+            self.load_model(data)
+
+    def _import_model_dialog(self):
+        """Copy an image file into model/ and use it."""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open Template Image",
+            "Import template into model/",
             "",
             "Image Files (*.png *.jpg *.jpeg *.bmp);;All Files (*)"
         )
         if not path:
-            return
-        
-        tpl = cv2.imread(path)
-        if tpl is None:
-            self.result_label.setText(f"Failed to load: {os.path.basename(path)}")
-            return
-        self.template_cv_image = tpl
-        self.image2.set_cv_image(self.template_cv_image, is_original=True)
-        # enable crop/save-ish UI as before (keep naming for minimal change)
-        self._init_native_matcher()
-        self.open_template_button.setEnabled(True)
-        self.result_label.setText(f"Template loaded: {os.path.basename(path)}")
-
-    def _init_native_matcher(self):
-        """Initialize native matcher (matching2) with current template."""
-        if tm_matching is None or self.template_cv_image is None:
+            self._populate_models()          # drop the 'Import' selection
             return
         try:
-            gray = self.template_cv_image
-            if gray.ndim == 3:
-                gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-            # create matcher only once (recreate when template changes)
-            lib_path = tm_matching.resolve_lib_path()
-            self._matcher = tm_matching.Matcher(
-                lib_path,
-                maxCount=1,
-                scoreThreshold=0.55,
-                iouThreshold=0.4,
-                angle=360,
-                minArea=64
-            )
-            self._matcher.set_template(gray)
-            self._template_size = (gray.shape[1], gray.shape[0])
+            name = model_store.import_model(path)
+        except OSError as e:
+            self.result_label.setText(f"Import failed: {e}")
+            self._populate_models()
+            return
+        self.load_model(name)
+
+    def load_model(self, name_or_path: str, persist: bool = True) -> bool:
+        """Make a template file (a name in model/, or any path) the current template: show it, re-create the matcher and
+        remember the choice in config.ini ([find_oring] template_file)."""
+        path = model_store.resolve_model_path(name_or_path)
+        tpl = cv2.imread(path) if path else None
+        if tpl is None:
+            self.result_label.setText(f"Failed to load template: {name_or_path}")
+            self._populate_models()          # put the selection back on the model in use
+            return False
+        self.template_cv_image = tpl
+        self.current_model_name = os.path.basename(path) if model_store.in_model_dir(path) else None
+        self.image2.set_cv_image(tpl, is_original=True)
+        self._init_native_matcher()
+        if persist and self.current_model_name:
+            try:
+                model_store.save_template_name(self.current_model_name)
+            except OSError as e:
+                self.result_label.setText(f"Template loaded but not saved to config: {e}")
+        self._populate_models()
+        msg = f"Template loaded: {os.path.basename(path)} ({tpl.shape[1]}×{tpl.shape[0]})"
+        if model_store.is_small((tpl.shape[1], tpl.shape[0])):
+            msg += f"  ⚠ เล็กกว่าชิ้นงาน อาจได้ NA มาก (แนะนำ {model_store.DEFAULT_TEMPLATE})"
+        self.result_label.setText(msg)
+        return True
+
+    def _load_default_template(self):
+        """Template at start-up: [find_oring] template_file of config.ini, else the default model."""
+        try:
+            name = self._read_find_oring_config().get("template_file", "") or model_store.DEFAULT_TEMPLATE
+            if not model_store.resolve_model_path(name):
+                name = model_store.DEFAULT_TEMPLATE
+            self.load_model(name, persist=False)
+        except Exception:
+            if os.environ.get("UBEND_DEBUG"):
+                print("DEBUG: failed loading default template", flush=True)
+
+    # -------------------------------------------------------------
+    # Matching: every part of the frame -> judge each part -> show / count / report / send
+    # -------------------------------------------------------------
+    def _init_native_matcher(self):
+        """Create the part matcher for the current template (native library + NaN-safe retries, see app/part_matcher.py)."""
+        self._part_matcher = self._matcher = None
+        if self.template_cv_image is None:
+            return
+        try:
+            self._part_matcher = self._matcher = PartMatcher(self.template_cv_image)
+            self._template_size = self._part_matcher.template_size
         except Exception as e:
-            self._matcher = None
+            self._part_matcher = self._matcher = None
             self.result_label.setText(f"Matcher init error: {e}")
-    
+
+    def apply_oring_settings(self, settings=None):
+        """Take new OK/NG settings (SETTINGS page after Save) into use from the next frame on."""
+        self.oring_settings = (settings or load_settings()).clean()
+        self._params = self.oring_settings.to_params()
+
+    def match_parts(self, frame):
+        """Every U-bend in the frame -> list of parts (crop, quad, score, ...). IMAGE 1 shows the frame with numbered boxes."""
+        if self._part_matcher is None:
+            self._init_native_matcher()
+            if self._part_matcher is None:
+                self.result_label.setText("Matcher not ready")
+                return []
+        if frame is None or frame.size == 0:
+            self.result_label.setText("No target frame")
+            return []
+        try:
+            parts = self._part_matcher.crop_all(frame)
+        except Exception as e:
+            self.result_label.setText(f"Match call error: {e}")
+            return []
+        draw = frame.copy()
+        for k, p in enumerate(parts, 1):
+            q = np.rint(p["quad"]).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(draw, [q], True, (0, 255, 0), 3)
+            org = (int(q[:, 0, 0].min()), max(30, int(q[:, 0, 1].min()) - 10))
+            cv2.putText(draw, f"#{k} {p['score']:.2f}", org, cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3, cv2.LINE_AA)
+        self.image1.set_cv_image(draw, is_original=True)
+        return parts
+
+    def _evaluate_parts(self, parts):
+        """Judge every part: -> [dict(part, crop, vis, cls, info, score)] (cls = OK / NG / NA)."""
+        results = []
+        for k, part in enumerate(parts, 1):
+            crop = part["crop"]
+            if self.oring_settings.engine == "legacy":
+                vis, cls = self.find_oring_legacy(crop)
+                info = {}
+            else:
+                vis, cls, info = find_oring_v2(crop, self._params)
+            if vis is None:
+                vis = crop
+            if len(parts) > 1:
+                cv2.putText(vis, f"#{k}", (vis.shape[1] - 45, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            results.append(dict(part=k, crop=crop, vis=vis, cls=cls, info=info, score=part["score"]))
+        return results
+
+    @staticmethod
+    def _reason_short(info: dict) -> str:
+        """Why the first leg that is not OK is not OK (for the status line)."""
+        for side in "LR":
+            if info.get("status", {}).get(side) in ("NG", "NA"):
+                reason = info.get(side, {}).get("reason", "")
+                return (f"{side}: {reason}" if reason else side)[:60]
+        return ""
+
+    def _summary_text(self, results, ms: float) -> str:
+        n = len(results)
+        if n == 1:
+            r = results[0]
+            reason = self._reason_short(r["info"])
+            txt = r["cls"] + (f" ({reason})" if reason else "")
+        elif n <= 5:
+            txt = f"{n} parts: " + "  ".join(f"#{r['part']} {r['cls']}" for r in results)
+        else:
+            counts = {c: sum(1 for r in results if r["cls"] == c) for c in ("OK", "NG", "NA")}
+            txt = f"{n} parts: " + "  ".join(f"{c} {k}" for c, k in counts.items() if k)
+        return f"{txt}    [{ms:.0f} ms]"
+
+    def _show_results(self, results, ms: float):
+        crops = make_montage([r["crop"] for r in results])
+        vis = make_montage([r["vis"] for r in results])
+        self.cropped_cv_frame = crops
+        self.image3.set_cv_image(crops, is_original=True)
+        self.image4.set_cv_image(vis, is_original=True)
+        self.last_results = results
+        self.parts_evaluated.emit([dict(part=r["part"], crop=r["crop"], cls=r["cls"], info=r["info"]) for r in results])
+        self.result_label.setText(self._summary_text(results, ms))
+
+    def _publish_results(self, frame, results):
+        """Counters, report rows and UDP for the parts of one frame (every part counts: 4 parts in the picture = 4 counts)."""
+        st = self.oring_settings
+        n = len(results)
+        shared_input = None
+        for r in results:
+            cls = r["cls"]
+            self._increment_counters(cls)
+            try:
+                shared_input = self._save_report_entry(frame, r["vis"], cls, shared_input)
+            except Exception:
+                shared_input = None
+            try:
+                self.classification_emitted.emit(cls)
+            except Exception:
+                pass
+            if st.send_per == "part":
+                self._send_classification_udp(st.sent_value(cls), part=r["part"], parts=n)
+        if st.send_per == "frame":
+            classes = [r["cls"] for r in results]
+            worst = "NG" if "NG" in classes else ("NA" if "NA" in classes else "OK")
+            self._send_classification_udp(st.sent_value(worst), parts=n)
+
     def run_match_on_current_frame(self):
         # ป้องกันเรียกซ้อนถ้ามีการรันอยู่แล้ว
         if self.matching_running:
             return
         self.matching_running = True
-        timings = {}
-        total_start = time.perf_counter()
         try:
             if self.template_cv_image is None:
                 self.result_label.setText("No template")
@@ -680,46 +851,20 @@ class HomePage(QWidget):
             if self.cv_frame is None:
                 self.result_label.setText("No live frame")
                 return
-            input_for_log = self.cv_frame.copy()
-
+            frame = self.cv_frame.copy()
             t0 = time.perf_counter()
-            crop = self.rotation_matching2(self.cv_frame, self.template_cv_image)
-            timings['rotation_matching'] = (time.perf_counter() - t0) * 1000.0
-
-            if crop is None:
+            parts = self.match_parts(frame)
+            if not parts:
                 self.result_label.setText("No match found")
                 return
-
-            self.cropped_cv_frame = crop
-
-            t1 = time.perf_counter()
-            self.image3.set_cv_image(crop, is_original=True)
-            timings['set_image3'] = (time.perf_counter() - t1) * 1000.0
-
-            # find_oring ตอนนี้คืน (final_img, classification)
-            t2 = time.perf_counter()
-            final_img, classification = self.find_oring(crop)
-            timings['find_oring'] = (time.perf_counter() - t2) * 1000.0
-
-            if final_img is None:
-                self.result_label.setText("final_img not found")
-                return
-
-            t3 = time.perf_counter()
-            self.image4.set_cv_image(final_img, is_original=True)
-            timings['set_image4'] = (time.perf_counter() - t3) * 1000.0
-            crop = None  # free memory
-            # บันทึกเฉพาะ OK / NG / NA
-            try:
-                self._save_report_entry(input_for_log, final_img, classification)
-            except Exception:
-                pass
-
-            total_ms = (time.perf_counter() - total_start) * 1000.0
-            # self.result_label.setText(f"{classification} | Total {total_ms:.1f}ms")
+            results = self._evaluate_parts(parts)
+            self._show_results(results, (time.perf_counter() - t0) * 1000.0)
+            self._publish_results(frame, results)
+        except Exception as e:          # one bad frame must never stop the line
+            traceback.print_exc()
+            self.result_label.setText(f"Error: {e}")
         finally:
             self.matching_running = False
-            # self.cv_frame = None
 
     def toggle_auto_match(self, checked: bool):
         """เปิด/ปิดโหมดจับคู่ต่อเฟรม; ถ้ายังไม่เปิดกล้องจะเปิดให้เอง"""
@@ -839,74 +984,7 @@ class HomePage(QWidget):
         QApplication.processEvents()
         return crop
 
-    def rotation_matching2(self, target_image, template):
-        """Use native matcher (matching2). Returns rectified crop or None."""
-        if self._matcher is None:
-            self._init_native_matcher()
-            if self._matcher is None:
-                self.result_label.setText("Matcher not ready")
-                return None
-        if target_image is None or target_image.size == 0:
-            self.result_label.setText("No target frame")
-            return None
-        try:
-            # Run native match (internally converts to gray)
-            match_count = self._matcher.match(target_image)
-        except Exception as e:
-            self.result_label.setText(f"Match call error: {e}")
-            return None
-        if match_count <= 0:
-            self.result_label.setText("No match")
-            return None
-
-        res = self._matcher.results[0]
-        if res.score <= 0:
-            self.result_label.setText("Low score")
-            return None
-
-        # Corner order from wrapper: leftTop, leftBottom, rightBottom, rightTop
-        corners = np.array([
-            [res.leftTopX, res.leftTopY],
-            [res.leftBottomX, res.leftBottomY],
-            [res.rightBottomX, res.rightBottomY],
-            [res.rightTopX, res.rightTopY]
-        ], dtype=np.float32)
-
-        draw_img = target_image.copy()
-        pts_int = corners.astype(np.int32).reshape(-1,1,2)
-        cv2.polylines(draw_img, [pts_int], True, (0,255,0), 2)
-        cv2.putText(draw_img, f"{res.angle:.1f}deg {res.score:.2f}",
-                    (int(res.centerX)+5, int(res.centerY)+5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
-        self.image1.set_cv_image(draw_img, is_original=True)
-
-        # Warp to template size (rectified crop)
-        if self._template_size is None:
-            self.result_label.setText("No template size")
-            return None
-        tw, th = self._template_size
-        dst_quad = np.array([
-            [0,0],
-            [0,th-1],
-            [tw-1,th-1],
-            [tw-1,0]
-        ], dtype=np.float32)
-
-        try:
-            M = cv2.getPerspectiveTransform(corners, dst_quad)
-            warped = cv2.warpPerspective(target_image, M, (tw, th),
-                                         flags=cv2.INTER_LINEAR,
-                                         borderMode=cv2.BORDER_CONSTANT,
-                                         borderValue=(255,255,255))
-        except Exception as e:
-            self.result_label.setText(f"Warp error: {e}")
-            return None
-
-        self.image3.set_cv_image(warped, is_original=True)
-        QApplication.processEvents()
-        return warped
-
-    def find_oring(self, image: np.ndarray,
+    def find_oring_legacy(self, image: np.ndarray,
                    large_area: int = 5000,
                    dif_zone: int = 0,
                    h_oring: int = 65,
@@ -985,8 +1063,6 @@ class HomePage(QWidget):
         contours2, _ = cv2.findContours(work, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         # contours2, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.imshow("debug_edges", work)
-        cv2.imshow("debug_smoothed", smoothed)
 
         large_contours = [c for c in contours2 if cv2.contourArea(c) >= large_area]
 
@@ -1084,12 +1160,6 @@ class HomePage(QWidget):
         else:
             classification = "NA"
             data = "NA"
-        self._increment_counters(classification)
-        try:
-            self.classification_emitted.emit(classification)   # <-- emit result
-            self._send_classification_udp(data)  # <-- send via UDP
-        except Exception:
-            pass
         return p, classification
 
     def cleanup(self):
@@ -1174,7 +1244,8 @@ class HomePage(QWidget):
             QApplication.processEvents()
         except Exception:
             pass
-        self.open_template_button.setEnabled(True)
+        self.current_model_name = None            # an unsaved crop: no entry of the MODEL list yet
+        self._populate_models()
         self.result_label.setText("Template created")
         self._switch_crop_button_to_save()
 
@@ -1214,18 +1285,26 @@ class HomePage(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Matching Template",
-            "",
+            os.path.join(model_store.ensure_dir(), model_store.next_model_name()),   # suggested: model/model<N+1>.png
             "PNG Images (*.png);;JPEG Images (*.jpg *.jpeg)"
         )
         if not path:
             # user canceled; keep button as SAVE MATCHING
             return
         try:
-            cv2.imwrite(path, self.template_cv_image)
+            if not cv2.imwrite(path, self.template_cv_image):
+                raise OSError("cv2.imwrite failed")
             self.result_label.setText(f"Template saved: {os.path.basename(path)}")
         except Exception as e:
             self.result_label.setText(f"Save failed: {e}")
             return
+        if model_store.in_model_dir(path):          # a new entry of the MODEL list, selected right away
+            self.current_model_name = os.path.basename(path)
+            try:
+                model_store.save_template_name(self.current_model_name)
+            except OSError:
+                pass
+            self._populate_models()
         # revert button back to crop mode
         self._restore_crop_button()
 
@@ -1279,7 +1358,7 @@ class HomePage(QWidget):
         except Exception:
             pass
 
-    def _send_classification_udp(self, classification: str):
+    def _send_classification_udp(self, classification: str, part=None, parts=None):
         """Send classification via UDP (fire & forget)."""
         if not self.tcp_enabled:
             return
@@ -1298,6 +1377,10 @@ class HomePage(QWidget):
                     "total": self.count_total
                 }
             }
+            if part is not None:
+                payload["part"] = part
+            if parts is not None:
+                payload["parts"] = parts
             msg = json.dumps(payload) + "\n"
         else:
             msg = f"CLASSIFICATION,{classification},{timestamp},OK={self.count_ok},NG={self.count_ng},NA={self.count_na},TOTAL={self.count_total}\n"

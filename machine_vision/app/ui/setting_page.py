@@ -1,12 +1,18 @@
 from PySide6.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QLineEdit, QPushButton, QFormLayout,
     QGroupBox, QGridLayout, QSizePolicy, QSpinBox, QHBoxLayout, QLayout, QCheckBox,
-    QComboBox                                          # <-- added
+    QComboBox, QDoubleSpinBox, QScrollArea, QFrame, QMessageBox
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal, QTimer, QSize
 import configparser
 import os
-from PySide6.QtGui import QIntValidator, QDoubleValidator, QFont
+from collections import deque
+import cv2
+import numpy as np
+from PySide6.QtGui import QIntValidator, QDoubleValidator, QFont, QImage, QPixmap
+from app import ini_store
+from app.oring_settings import OringSettings, load_settings
+from app.oring_v2 import find_oring_v2
 # --- new imports for serial listing ---
 import glob
 try:
@@ -16,7 +22,37 @@ except ImportError:
     serial = None
     list_ports = None
 
+class ScaledImageLabel(QLabel):
+    """Shows a picture scaled to the label (keeps the aspect ratio) and re-scales it when the label is resized.
+    The size hints are fixed, so the picture never influences the layout (no resize feedback loop)."""
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._src = QPixmap()
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setAlignment(Qt.AlignCenter)
+
+    def sizeHint(self):
+        return QSize(640, 420)
+
+    def minimumSizeHint(self):
+        return QSize(320, 240)
+
+    def set_source(self, pix: QPixmap):
+        self._src = pix
+        self._fit()
+
+    def _fit(self):
+        if not self._src.isNull() and self.width() > 1 and self.height() > 1:
+            self.setPixmap(self._src.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit()
+
+
 class SettingPage(QWidget):
+    oring_settings_changed = Signal(object)     # OringSettings, after "Save Settings" (HomePage.apply_oring_settings)
+
     def __init__(self, data_count: int = 2,
                  plc_addr_start: int = 0, plc_addr_step: int = 2,
                  data_default: str = "NA", row_spacing: int = 22):
@@ -25,8 +61,22 @@ class SettingPage(QWidget):
         self.config_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.ini"))
         self.config = configparser.ConfigParser()
         self.load_config()
+        self.oring_settings = load_settings()        # OK/NG judgement ([oring_v2] of the same file)
+        self._recent = deque(maxlen=30)              # latest parts from HOME: dict(crop, label)
+        self._leg_stats = deque(maxlen=200)          # latest measured legs: dict(dist, bump, width)
+        self._preview_pos = 0                        # 0 = newest part
 
-        layout = QVBoxLayout(self)
+        # the page can be taller than the screen: everything lives in a scroll area
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(20, 20, 4, 4)
         layout.setSpacing(6)
         layout.setAlignment(Qt.AlignTop | Qt.AlignLeft)
@@ -36,8 +86,16 @@ class SettingPage(QWidget):
         title.setStyleSheet("font-size: 50px; font-weight: bold; color: #003366;")
         layout.addWidget(title)
         
-        # Group box for O-ring settings
-        oring_group = QGroupBox("setting oring")
+        # OK / NG judgement (new detector) + live preview
+        top_row = QHBoxLayout()
+        top_row.setSpacing(16)
+        top_row.addWidget(self._build_judgement_group(), 0, Qt.AlignTop)
+        top_row.addWidget(self._build_preview_group(), 1)          # stretches to the height of the judgement group
+        layout.addLayout(top_row)
+
+        # Group box for the legacy O-ring settings (only used by engine = legacy)
+        oring_group = QGroupBox("setting oring (legacy)")
+        self.oring_group = oring_group
         oring_group.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
         oring_group.setFixedWidth(420)
         
@@ -85,6 +143,7 @@ class SettingPage(QWidget):
         form_layout.addRow(QLabel("Rect height ratio:"), self.rect_ratio_input)
 
         layout.addWidget(oring_group)
+        oring_group.setVisible(self.oring_settings.engine == "legacy")
 
         # --- Report group: choice to save images in report ---
         report_group = QGroupBox("REPORT")
@@ -249,6 +308,8 @@ class SettingPage(QWidget):
             }
 
     def save_config(self):
+        # start from the file as it is NOW: HomePage (selected model) and others write to it after this page was created
+        self.config = ini_store.read_ini(self.config_file)
         # ensure section exists
         if not self.config.has_section('find_oring'):
             self.config.add_section('find_oring')
@@ -278,8 +339,213 @@ class SettingPage(QWidget):
         self.config['serial']['bytesize'] = self.serial_bytesize_combo.currentText()
         self.config['serial']['slave_id'] = str(self.modbus_slave_spin.value())
 
-        with open(self.config_file, 'w') as configfile:
-            self.config.write(configfile)
+        # O-ring judgement ([oring_v2])
+        settings = self._collect_oring_settings()
+        if not self.config.has_section('oring_v2'):
+            self.config.add_section('oring_v2')
+        for k, v in settings.to_section().items():
+            self.config['oring_v2'][k] = str(v)
+
+        try:
+            ini_store.write_ini(self.config, self.config_file, backup=True)
+        except OSError as e:
+            QMessageBox.critical(self, "Save Settings", f"บันทึกไม่สำเร็จ: {e}")
+            return
+        self.oring_settings = settings
+        self.oring_settings_changed.emit(settings)
+        self.save_button.setText("Saved ✓")
+        QTimer.singleShot(1500, lambda: self.save_button.setText("Save Settings"))
+
+    # ------------------------------------------------------------------
+    # O-RING JUDGEMENT (OK / NG settings) + live preview of the latest parts
+    # ------------------------------------------------------------------
+    def _build_judgement_group(self) -> QGroupBox:
+        st = self.oring_settings
+        g = QGroupBox("O-RING JUDGEMENT  (เกณฑ์ตัดสิน OK / NG)")
+        g.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Minimum)
+        g.setFixedWidth(470)
+        form = QFormLayout(g)
+        form.setLabelAlignment(Qt.AlignLeft)
+
+        self.dist_nominal_spin = QSpinBox()
+        self.dist_nominal_spin.setRange(0, 300)
+        self.dist_nominal_spin.setSuffix(" px")
+        self.dist_nominal_spin.setValue(st.dist_nominal_px)
+        self.dist_tol_spin = QSpinBox()
+        self.dist_tol_spin.setRange(0, 150)
+        self.dist_tol_spin.setPrefix("± ")
+        self.dist_tol_spin.setSuffix(" px")
+        self.dist_tol_spin.setValue(st.dist_tol_px)
+        for w in (self.dist_nominal_spin, self.dist_tol_spin):
+            w.setFixedWidth(100)
+        dist_row = QHBoxLayout()
+        dist_row.addWidget(self.dist_nominal_spin)
+        dist_row.addWidget(self.dist_tol_spin)
+        dist_row.addStretch()
+        dist_w = QWidget()
+        dist_w.setLayout(dist_row)
+        dist_w.setToolTip("ระยะจากแหวนถึงปลายท่อ: ค่ากลาง ± ความคลาดเคลื่อน\nแหวนอยู่นอกช่วงนี้ = NG")
+        form.addRow(QLabel("ตำแหน่งแหวน\n(ระยะจากปลายท่อ):"), dist_w)
+        self.dist_range_label = QLabel()
+        self.dist_range_label.setStyleSheet("color:#003366; font-weight:bold;")
+        form.addRow(QLabel(""), self.dist_range_label)
+
+        self.min_bump_spin = QDoubleSpinBox()
+        self.min_bump_spin.setRange(0.0, 50.0)
+        self.min_bump_spin.setSingleStep(0.5)
+        self.min_bump_spin.setDecimals(1)
+        self.min_bump_spin.setSuffix(" px")
+        self.min_bump_spin.setValue(st.min_bump_px)
+        self.min_bump_spin.setFixedWidth(100)
+        self.min_bump_spin.setToolTip("แหวนต้องยื่นออกจากผิวท่ออย่างน้อยเท่านี้ ถึงจะนับว่ามีแหวน\n"
+                                      "ค่าสูง = เข้มงวดขึ้น (NG มากขึ้น)  ค่าต่ำ = ผ่อนปรน\n"
+                                      "ข้อมูลจริง: มีแหวน 10-24 px, ไม่มีแหวน 0-3 px")
+        form.addRow(QLabel("แหวนต้องนูนอย่างน้อย:"), self.min_bump_spin)
+
+        self.min_width_spin = QSpinBox()
+        self.min_width_spin.setRange(0, 400)
+        self.min_width_spin.setSuffix(" px")
+        self.min_width_spin.setSpecialValueText("ไม่ตรวจ")
+        self.min_width_spin.setValue(st.min_width_px)
+        self.min_width_spin.setFixedWidth(100)
+        self.min_width_spin.setToolTip("ความกว้างของแหวนขั้นต่ำ (0 = ไม่ตรวจ)")
+        form.addRow(QLabel("ความกว้างแหวนขั้นต่ำ:"), self.min_width_spin)
+
+        self.na_combo = QComboBox()
+        for label, value in (("NG  (ถือว่าไม่ผ่าน)", "NG"), ("NA  (ส่งตามจริง)", "NA"), ("OK  (ถือว่าผ่าน)", "OK")):
+            self.na_combo.addItem(label, value)
+        self.na_combo.setCurrentIndex(max(0, self.na_combo.findData(st.na_send_as)))
+        self.na_combo.setToolTip("ชิ้นงานที่ประเมินไม่ได้ (NA) เช่น ซ้อนกัน/เอียงมาก/ถูกตัดขอบ\nจะส่งไป PLC / UDP เป็นค่านี้ (หน้าจอและรายงานยังแสดงเป็น NA)")
+        form.addRow(QLabel("ผล NA ส่งไป PLC/UDP เป็น:"), self.na_combo)
+
+        self.show_measure_check = QCheckBox("แสดงตัวเลขที่วัดบนภาพผลลัพธ์")
+        self.show_measure_check.setChecked(st.show_measure)
+        form.addRow(QLabel(""), self.show_measure_check)
+
+        self.recent_label = QLabel("ค่าที่วัดล่าสุด: -")
+        self.recent_label.setWordWrap(True)
+        self.recent_label.setStyleSheet("color:#444;")
+        form.addRow(self.recent_label)
+
+        reset_btn = QPushButton("คืนค่าเริ่มต้น")
+        reset_btn.setFixedWidth(130)
+        reset_btn.clicked.connect(self._reset_judgement_defaults)
+        form.addRow(reset_btn)
+        hint = QLabel("ภาพตัวอย่างทางขวาใช้ค่าในหน้านี้ทันที\nกด Save Settings ด้านล่างเพื่อใช้ค่าใหม่กับการตรวจจริง")
+        hint.setStyleSheet("color:#777; font-size:11px;")
+        form.addRow(hint)
+
+        for w in (self.dist_nominal_spin, self.dist_tol_spin, self.min_bump_spin, self.min_width_spin):
+            w.valueChanged.connect(self._on_judgement_changed)
+        self.na_combo.currentIndexChanged.connect(self._on_judgement_changed)
+        self.show_measure_check.toggled.connect(self._on_judgement_changed)
+        self._update_range_label()
+        return g
+
+    def _build_preview_group(self) -> QGroupBox:
+        g = QGroupBox("ภาพตัวอย่าง  (ชิ้นงานล่าสุดจากหน้า HOME)")
+        v = QVBoxLayout(g)
+        self.preview_label = ScaledImageLabel("ยังไม่มีภาพ - กด RUN ที่หน้า HOME ก่อน")
+        self.preview_label.setStyleSheet("background-color:#111; color:#ccc; border:1px solid #444;")
+        v.addWidget(self.preview_label, 1)
+        self.preview_verdict = QLabel("")
+        self.preview_verdict.setWordWrap(True)
+        self.preview_verdict.setStyleSheet("font-weight:bold; font-size:14px;")
+        v.addWidget(self.preview_verdict)
+        nav = QHBoxLayout()
+        self.preview_prev = QPushButton("◀  เก่ากว่า")
+        self.preview_next = QPushButton("ใหม่กว่า  ▶")
+        self.preview_info = QLabel("")
+        self.preview_info.setAlignment(Qt.AlignCenter)
+        self.preview_prev.clicked.connect(lambda: self._move_preview(+1))
+        self.preview_next.clicked.connect(lambda: self._move_preview(-1))
+        nav.addWidget(self.preview_prev)
+        nav.addWidget(self.preview_info, 1)
+        nav.addWidget(self.preview_next)
+        v.addLayout(nav)
+        return g
+
+    def _collect_oring_settings(self) -> OringSettings:
+        """The judgement settings as shown on this page (engine / send_per are not in the UI: kept from the file)."""
+        base = self.oring_settings
+        return OringSettings(
+            engine=base.engine,
+            dist_nominal_px=self.dist_nominal_spin.value(),
+            dist_tol_px=self.dist_tol_spin.value(),
+            min_bump_px=self.min_bump_spin.value(),
+            min_width_px=self.min_width_spin.value(),
+            na_send_as=self.na_combo.currentData() or base.na_send_as,
+            send_per=base.send_per,
+            show_measure=self.show_measure_check.isChecked(),
+        ).clean()
+
+    def _reset_judgement_defaults(self):
+        d = OringSettings()
+        self.dist_nominal_spin.setValue(d.dist_nominal_px)
+        self.dist_tol_spin.setValue(d.dist_tol_px)
+        self.min_bump_spin.setValue(d.min_bump_px)
+        self.min_width_spin.setValue(d.min_width_px)
+        self.na_combo.setCurrentIndex(max(0, self.na_combo.findData(d.na_send_as)))
+        self.show_measure_check.setChecked(d.show_measure)
+
+    def _update_range_label(self):
+        lo, hi = self._collect_oring_settings().dist_range
+        self.dist_range_label.setText(f"→ OK เมื่อแหวนอยู่ห่างปลายท่อ {lo} – {hi} px")
+
+    def _on_judgement_changed(self, *_):
+        self._update_range_label()
+        self._refresh_preview()
+
+    # ---- latest parts from HomePage ----
+    def on_parts_evaluated(self, items: list):
+        """Slot of HomePage.parts_evaluated: keep the latest crops for the preview and the measured numbers."""
+        for it in reversed(items):                   # so that part #1 of the frame ends up first (newest)
+            self._recent.appendleft(dict(crop=it["crop"], label=f"ชิ้น #{it['part']}"))
+            for side in "LR":
+                d = it.get("info", {}).get(side, {})
+                if "dist" in d:
+                    self._leg_stats.append(dict(dist=d["dist"], bump=d["bump"], width=d["width"]))
+        if self._preview_pos > 0:                    # keep showing the same part while the user browses
+            self._preview_pos = min(self._preview_pos + len(items), max(0, len(self._recent) - 1))
+        if items:
+            last = items[0].get("info", {})
+            parts = []
+            for side in "LR":
+                d = last.get(side, {})
+                parts.append(f"{side}: ระยะ {d['dist']:.0f} / นูน {d['bump']:.0f}" if "dist" in d else f"{side}: -")
+            txt = "ค่าที่วัดล่าสุด:  " + "   ".join(parts)
+            if self._leg_stats:
+                dist = np.array([x["dist"] for x in self._leg_stats]); bump = np.array([x["bump"] for x in self._leg_stats])
+                txt += (f"\n{len(self._leg_stats)} ขาล่าสุด: ระยะ {dist.min():.0f}–{dist.max():.0f} (เฉลี่ย {dist.mean():.0f}), "
+                        f"นูน {bump.min():.0f}–{bump.max():.0f}")
+            self.recent_label.setText(txt)
+        self._refresh_preview()
+
+    def _move_preview(self, delta: int):
+        if self._recent:
+            self._preview_pos = min(max(self._preview_pos + delta, 0), len(self._recent) - 1)
+            self._refresh_preview()
+
+    def _refresh_preview(self):
+        """Re-judge the selected recent part with the values currently shown on this page and draw it."""
+        n = len(self._recent)
+        self.preview_prev.setEnabled(n > 0 and self._preview_pos < n - 1)
+        self.preview_next.setEnabled(n > 0 and self._preview_pos > 0)
+        if not n:
+            return
+        self._preview_pos = min(self._preview_pos, n - 1)
+        item = self._recent[self._preview_pos]
+        vis, cls, info = find_oring_v2(item["crop"], self._collect_oring_settings().to_params())
+        rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QImage.Format_RGB888).copy()
+        self.preview_label.set_source(QPixmap.fromImage(qimg))
+        st = info.get("status", {})
+        reasons = [f"{s}: {info[s]['reason']}" for s in "LR" if info.get(s, {}).get("reason")]
+        color = {"OK": "#1b8a1b", "NG": "#c62828", "NA": "#b8860b"}.get(cls, "#333")
+        self.preview_verdict.setStyleSheet(f"font-weight:bold; font-size:14px; color:{color};")
+        self.preview_verdict.setText(f"ผล: {cls}   (ซ้าย {st.get('L', '-')}, ขวา {st.get('R', '-')})"
+                                     + (("\n" + " | ".join(reasons)) if reasons else ""))
+        self.preview_info.setText(f"{item['label']}   ({self._preview_pos + 1}/{n})")
 
     # --- Methods from IoPage ---
     def _create_row(self, row_index: int, key: str):

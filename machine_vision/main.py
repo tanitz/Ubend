@@ -46,6 +46,9 @@ class MainWindow(QMainWindow):
         # connect signals (Home -> Setting)
         self.home_page.oring_status.connect(self.setting_page.update_oring)
         self.home_page.emit_summary.connect(self.setting_page.parse_and_update)
+        # OK/NG settings: SETTINGS -> HOME (used from the next frame), HOME -> SETTINGS (live preview / measured values)
+        self.setting_page.oring_settings_changed.connect(self.home_page.apply_oring_settings)
+        self.home_page.parts_evaluated.connect(self.setting_page.on_parts_evaluated)
 
         # add tabs
         self.tabs.addTab(self.home_page, "HOME")           # index 0
