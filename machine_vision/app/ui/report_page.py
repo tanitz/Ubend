@@ -1,6 +1,7 @@
 import os
 import csv
 import base64
+from app import storage
 from datetime import datetime
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
@@ -162,7 +163,7 @@ class ReportPage(QWidget):
 
     # --- Data helpers ---
     def _get_base_report_dir(self) -> str:
-        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "report"))
+        return str(storage.report_dir())
 
     def _find_latest_report_csv(self) -> str | None:
         base = self._get_base_report_dir()
@@ -201,6 +202,11 @@ class ReportPage(QWidget):
                 return header, rows
             for row in reader:
                 if row:
+                    for key in ("input_image", "output_image"):
+                        if key in header:
+                            column = header.index(key)
+                            if column < len(row):
+                                row[column] = storage.resolve_report_image(row[column], csv_path)
                     rows.append(row)
         return header, rows
 

@@ -1,1 +1,11 @@
 /img
+
+# Generated data and local Python environments
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+/machine_vision/ubend/
+/machine_vision/report/
+/machine_vision/config_backup/
+/audit-results/

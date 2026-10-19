@@ -1,0 +1,55 @@
+Ubend: code and generated data
+
+The checkout contains application code, test scripts, model/ templates and native/
+libraries. Generated reports, QA images, cache and audit results live outside it:
+
+  ~/UbendData/report/YYYY/MM/report.csv + image/
+  ~/UbendData/testing/cache/
+  ~/UbendData/testing/results/qa/   (other out*/qa* folders are also here)
+  ~/UbendData/testing/logs/
+  ~/UbendData/audit/
+  ~/UbendData/config_backup/
+  ~/UbendData/migration/           (migration manifest and original CSV backups)
+
+Set [storage] data_dir in app/config.ini, or override it with UBEND_DATA_DIR.
+Use an absolute path or ~/...; a relative config value is relative to machine_vision/.
+Changing this path does not move existing files; move them with the app stopped.
+
+New report CSV image paths are relative to the CSV directory (image/name.jpg).
+The REPORT page and offline tools resolve both relative paths and old absolute
+report paths. Images, CSV row order, results and timestamps are preserved during
+migration. Original CSVs are backed up outside the checkout before rewriting paths.
+
+Setup / run from machine_vision/:
+  python3 -m venv ubend
+  ubend/bin/python -m pip install -r requirements.txt
+  ./run_app.sh
+The local environment ubend/ is ignored by Git and is intentionally kept in place
+so existing launch scripts continue to work. The native matcher additionally needs
+the system OpenCV runtime described in native/README.txt.
+
+Tests:
+  ubend/bin/python -B tests/check_storage.py
+  ubend/bin/python -B tests/check_stores.py
+  ubend/bin/python -B tests/check_app_offscreen.py
+The offscreen integration test uses temporary outputs; its real-image fixtures are
+read from <data_dir>/report/2026/09/report.csv.
+
+Offline tools use the same configured external data root. Examples:
+  ubend/bin/python oring_test/build_cache.py --jobs 2
+  ubend/bin/python oring_test/run_from_cache.py --indices 1783 --jobs 1
+  ubend/bin/python oring_test/qa_zoom.py 1783 2
+  ubend/bin/python oring_test/viewer_oring_v2.py
+To analyse a different month, pass --csv /path/to/report.csv.
+
+One-time migration of an old checkout (app stopped, same filesystem):
+  ubend/bin/python -B tools/migrate_data.py
+The tool refuses to overwrite existing destination folders. It verifies file sizes,
+mtimes and inodes across renames, backs up CSVs and checks image references.
+Missing references that existed before migration are recorded separately.
+
+Git:
+Generated data, __pycache__, bytecode and the environment are ignored. Removing
+previously tracked files from the index produces staged deletions for the next
+commit; it does not delete the external data or the local environment. Old commits
+still contain their original files; this migration does not rewrite Git history.

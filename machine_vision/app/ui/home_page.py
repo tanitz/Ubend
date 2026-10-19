@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QPoint, QRect, QEvent, Signal, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QFont
 from PySide6.QtWidgets import QApplication
 import app.matching
+from app import storage
 try:
     demo_match_path = "/home/snc/Documents/DEMO/opencv_matching"
     if demo_match_path not in sys.path:
@@ -427,9 +428,7 @@ class HomePage(QWidget):
     # -------------------------------------------------------------
     def _get_report_month_dir(self) -> str:
         """Return absolute path to report/<YYYY>/<MM>, creating dirs as needed."""
-        base_report_dir = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "..", "report")
-        )
+        base_report_dir = str(storage.report_dir())
         now = datetime.now()
         year_dir = os.path.join(base_report_dir, now.strftime("%Y"))
         month_dir = os.path.join(year_dir, now.strftime("%m"))
@@ -520,7 +519,8 @@ class HomePage(QWidget):
                 writer = csv.writer(f)
                 if write_header:
                     writer.writerow(["index", "time", "result", "input_image", "output_image"])
-                writer.writerow([index_val, ts, test_result, in_path, out_path])
+                writer.writerow([index_val, ts, test_result,
+                                 os.path.relpath(in_path, month_dir), os.path.relpath(out_path, month_dir)])
         except Exception:
             # Silently ignore CSV errors to avoid UI interruption
             pass
